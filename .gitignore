@@ -6,3 +6,15 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# iKit Temp and Test files
+tmp/
+inbox/
+processed/
+*.py
+!scripts/*.py
+*.json
+*.m4a
+*.md
+!README.md
+!Package.swift

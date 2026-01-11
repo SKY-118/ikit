@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "iKit",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .executable(name: "ikit", targets: ["iKit"])
