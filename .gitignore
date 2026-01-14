@@ -30,3 +30,6 @@ check_*.swift
 
 # Local-only files (not committed)
 local/
+
+# Pre-commit
+.pre-commit-cache/

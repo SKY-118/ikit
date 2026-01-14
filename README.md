@@ -51,6 +51,43 @@ cp .build/release/ikit ~/.local/bin/ikit
 ```bash
 # Python 依赖（用于转录）
 pip install torch torchaudio funasr modelscope librosa scipy soundfile
+
+# Pre-commit hooks（开发）
+pip install pre-commit
+pre-commit install
+```
+
+---
+
+## 开发工具
+
+### Pre-commit Hooks
+
+项目使用 pre-commit 进行代码质量检查。配置文件：`.pre-commit-config.yaml`
+
+首次设置：
+```bash
+# 安装 pre-commit
+pip install pre-commit
+
+# 安装 git hooks
+pre-commit install
+
+# 手动运行所有检查
+pre-commit run --all-files
+```
+
+包含的检查：
+- **trailing-whitespace**: 删除行尾空白
+- **end-of-file-fixer**: 确保文件以换行符结尾
+- **check-yaml**: YAML 语法检查
+- **check-added-large-files**: 防止大文件（>1MB）
+- **detect-private-key**: 检测私钥泄露
+- **swift-format**: Swift 代码格式化（需单独安装：`brew install swift-format`）
+
+跳过检查（紧急情况）：
+```bash
+git commit --no-verify -m "message"
 ```
 
 ---
