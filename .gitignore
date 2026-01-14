@@ -1,20 +1,32 @@
 .DS_Store
-/.build
-/Packages
-xcuserdata/
-DerivedData/
-.swiftpm/configuration/registries.json
-.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
-.netrc
+.build/
+.swiftpm/
+*.xcodeproj/
 
-# iKit Temp and Test files
+# Runtime / Temp files
 tmp/
-inbox/
-processed/
-*.py
-!scripts/*.py
-*.json
 *.m4a
-*.md
-!README.md
-!Package.swift
+*.json
+*.log
+test_*.py
+test_*.sh
+DEBUGGING_REPORT.md
+DECISION_LOG_*.md
+check_mps.py
+
+# User Config (should not be in repo)
+config.json
+
+# Test data and builds
+inbox/
+daemon/
+scripts/__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test scripts
+test_*.swift
+check_*.swift
+
+# Local-only files (not committed)
+local/
