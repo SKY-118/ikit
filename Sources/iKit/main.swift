@@ -8,6 +8,7 @@ import Speech
 import ScreenCaptureKit
 import AVFoundation
 import AudioToolbox
+import IOKit
 
 // MARK: - Global Signal Handling
 /// Global flag for graceful shutdown (non-isolated)
@@ -1015,17 +1016,48 @@ class Daemon {
     private var currentSysPath: URL?
     private var cancellableTask: Task<Void, Never>?
     private let mode: RecordingMode
+    private var powerAssertionID: IOPMAssertionID = 0
 
     init(mode: RecordingMode = .both) {
         self.mode = mode
     }
 
+    // MARK: - Power Management (防止睡眠)
+    private func preventSleep() -> Bool {
+        let reason = "iKit Daemon: Preventing system sleep during recording" as CFString
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep,
+            reason,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            &powerAssertionID
+        )
+        return result == kIOReturnSuccess
+    }
+
+    private func allowSleep() {
+        if powerAssertionID != 0 {
+            IOPMAssertionRelease(powerAssertionID)
+            powerAssertionID = 0
+            Logger.info("💤 Sleep prevention disabled")
+        }
+    }
+
     func run(outputDir: String) async {
         // Setup logging to file
         Logger.setupLogging(outputDir: outputDir)
-        defer { Logger.closeLogging() }
+        defer {
+            Logger.closeLogging()
+            allowSleep()
+        }
 
         Logger.info("👻 Daemon started. Output: \(outputDir)")
+
+        // Prevent system sleep
+        if preventSleep() {
+            Logger.info("⚡ Sleep prevention enabled")
+        } else {
+            Logger.warn("⚠️ Failed to enable sleep prevention")
+        }
 
         // Show recording mode
         switch mode {
@@ -1229,22 +1261,79 @@ class Daemon {
             let hasMic = (self.mode == .both || self.mode == .micOnly) && fm.fileExists(atPath: micPath.path)
             let hasSys = (self.mode == .both || self.mode == .sysOnly) && fm.fileExists(atPath: sysPath.path)
 
+            var filesToProcess: [URL] = []
+
             if hasMic && hasSys {
                 // Both files exist - keep them separate for Python aggressive_gating
-                // Don't merge at all! Let Python handle gating with dual-track input.
-                // Just log that both files are ready for processing.
-                Logger.info("✅ Dual-track recording ready for Python gating")
-                // Keep both mic.m4a and sys.m4a files unchanged
-                // Python script will read them directly and apply aggressive_gating
+                Logger.info("✅ Dual-track recording ready for auto-processing")
+                filesToProcess.append(micPath)
+                filesToProcess.append(sysPath)
             } else if hasMic {
                 // Only mic file - rename to merged
                 try? fm.moveItem(at: micPath, to: finalPath)
+                filesToProcess.append(finalPath)
             } else if hasSys {
                 // Only sys file - rename to merged
                 try? fm.moveItem(at: sysPath, to: finalPath)
+                filesToProcess.append(finalPath)
             }
 
             Logger.info("✅ Saved: \(finalPath.lastPathComponent)")
+
+            // ⭐ Auto-process: Trigger transcription for each audio file
+            Task {
+                await self.autoProcessRecordings(filesToProcess, outputDir: finalPath.deletingLastPathComponent().path)
+            }
+        }
+    }
+
+    // MARK: - Auto-processing (自动转录)
+    private func autoProcessRecordings(_ files: [URL], outputDir: String) async {
+        let configManager = ConfigManager.shared
+
+        guard let python = configManager.current.python_path,
+              let script = configManager.current.transcribe_script else {
+            Logger.warn("⚠️  Python/Script not configured, skipping auto-transcription")
+            return
+        }
+
+        for audioFile in files {
+            let out = audioFile.deletingPathExtension().appendingPathExtension("json")
+
+            // Check if already transcribed
+            if FileManager.default.fileExists(atPath: out.path) {
+                Logger.info("⏭️  Already transcribed: \(audioFile.lastPathComponent)")
+                continue
+            }
+
+            Logger.info("🎤 Auto-transcribing: \(audioFile.lastPathComponent)")
+
+            let result = Shell.run(python, args: [script, audioFile.path, "--output", out.path])
+
+            if result.terminationStatus == 0 {
+                Logger.info("✅ Transcription complete: \(out.lastPathComponent)")
+
+                // Check if Ollama is available for summarization
+                if let ollamaURL = configManager.current.ollama_url,
+                   let url = URL(string: ollamaURL) {
+                    // Simple connectivity check
+                    var request = URLRequest(url: url)
+                    request.httpMethod = "HEAD"
+                    request.timeoutInterval = 2
+
+                    if let (_, response) = try? await URLSession.shared.data(for: request),
+                       let httpResponse = response as? HTTPURLResponse,
+                       httpResponse.statusCode == 200 {
+                        Logger.info("🤖 Ollama available, processing summary...")
+
+                        // Use SecretaryTool to process
+                        let secretary = SecretaryTool()
+                        await secretary.process(files: [out.path], outputDir: outputDir)
+                    }
+                }
+            } else {
+                Logger.error("❌ Transcription failed for: \(audioFile.lastPathComponent)")
+            }
         }
     }
 }
