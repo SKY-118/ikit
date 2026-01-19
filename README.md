@@ -132,6 +132,132 @@ python scripts/transcribe.py \
 
 ---
 
+## ⏰ Timer (定时任务)
+
+基于 macOS LaunchAgents 的定时提醒和自动化工具。
+
+### 功能特点
+- **灵活调度**: 支持一次性、每日、每周重复
+- **多文件支持**: 可同时打开多个文件或应用
+- **自动化工作流**: 打开文件 + 运行命令组合
+- **用户确认**: 触发时显示对话框，避免误操作
+- **执行日志**: 记录每次触发的详细历史
+
+### 使用示例
+
+#### 1. 每日提醒
+```bash
+# 每天下午 5 点提醒写日报
+ikit timer new --time 17:00 --daily --title "Daily Report" \
+  --message "Time to write your daily report"
+```
+
+#### 2. 多文件打开
+```bash
+# 每周一早上 9 点打开会议文档
+ikit timer new --time 09:00 --weekday 1 --title "Weekly Standup" \
+  --open ~/docs/agenda.md \
+  --open ~/docs/notes.txt \
+  --open ~/spreadsheet/budget.xlsx
+```
+
+#### 3. 打开 URL + 运行命令
+```bash
+# 周三下午 2 点打开会议链接，然后启动开发环境
+ikit timer new --time 14:00 --weekday 3 \
+  --open "https://meeting.url/join" \
+  --with "Google Chrome" \
+  --then-run "cd ~/work && npm start" \
+  --title "Team Meeting"
+```
+
+#### 4. 指定日期任务
+```bash
+# 2025-01-20 晚上 8 点提醒参加线上会议
+ikit timer new --time 20:00 --date 2025-01-20 \
+  --open "https://zoom.us/j/123456" \
+  --title "Product Review"
+```
+
+### 命令参考
+
+| 子命令 | 功能 | 示例 |
+|--------|------|------|
+| `new` | 创建定时任务 | `ikit timer new --time 09:00 --daily` |
+| `list` | 列出所有定时任务 | `ikit timer list` |
+| `cancel` | 取消定时任务 | `ikit timer cancel timer-daily-0900` |
+| `logs` | 查看执行日志 | `ikit timer logs timer-daily-0900` |
+
+### 参数说明
+
+| 参数 | 说明 | 示例 | 是否必需 |
+|------|------|------|----------|
+| `--time HH:MM` | 触发时间（24小时制）| `--time 09:30` | ✅ 是 |
+| `--daily` | 每天重复 | `--daily` | ❌ 否 |
+| `--date YYYY-MM-DD` | 指定日期（一次性）| `--date 2025-01-20` | ❌ 否 |
+| `--weekday N` | 每周重复（0=周日, 1=周一, ..., 6=周六）| `--weekday 1` | ❌ 否 |
+| `--open FILE` | 触发时打开文件（可多次使用）| `--open file.md` | ❌ 否 |
+| `--with APP` | 指定打开文件的应用 | `--with "Typora"` | ❌ 否 |
+| `--run COMMAND` | 直接运行命令（无确认）| `--run "notify-send Hello"` | ❌ 否 |
+| `--then-run COMMAND` | 确认后运行命令 | `--then-run "npm test"` | ❌ 否 |
+| `--terminal APP` | 运行命令的终端 | `--terminal Ghostty` | ❌ 否 |
+| `--title TITLE` | 对话框标题 | `--title "Meeting"` | ❌ 否 |
+| `--message TEXT` | 对话框内容 | `--message "Start?"` | ❌ 否 |
+
+### 工作原理
+
+1. **创建**: 生成 `~/Library/LaunchAgents/com.user.timer-<name>.plist`
+2. **加载**: 自动加载到 launchd（登录后自动生效）
+3. **触发**: 到达指定时间时执行 AppleScript：
+   - 记录触发日志
+   - 打开文件（如果指定）
+   - 显示确认对话框
+   - 运行命令（如果用户确认）
+4. **日志**: 执行历史保存在 `~/Library/Logs/com.user.ikit.timer/`
+
+### 注意事项
+
+- ⚠️ `--daily`、`--date`、`--weekday` 三者互斥，只能指定一个
+- ⚠️ 时间必须采用 24 小时制（09:00 表示上午 9 点，21:00 表示晚上 9 点）
+- ⚠️ 文件路径支持 `~` 展开为用户主目录
+- ⚠️ 使用 `launchctl list` 可查看系统级别的定时任务
+- 💡 定时任务在登录后自动加载，无需手动操作
+
+### 常见问题
+
+**Q: 如何查看定时任务是否已加载？**
+```bash
+# 方法 1: 使用 iKit
+ikit timer list
+
+# 方法 2: 使用 launchctl
+launchctl list | grep timer
+```
+
+**Q: 定时任务没有触发怎么办？**
+```bash
+# 1. 检查任务是否已加载
+launchctl list | grep timer
+
+# 2. 查看系统日志
+log show --predicate 'process == "launchd"' --last 1h | grep timer
+
+# 3. 查看执行日志
+ikit timer logs <identifier>
+```
+
+**Q: 如何永久删除定时任务？**
+```bash
+# 1. 取消任务（卸载 + 删除文件）
+ikit timer cancel <identifier>
+
+# 2. 手动清理（如果上述命令失败）
+launchctl bootout gui/$(id -u)/com.user.timer-<name>
+rm ~/Library/LaunchAgents/com.user.timer-<name>.plist
+```
+
+---
+
 ## Aggressive Gating 原理
 
 ### 问题：回声导致重复转录

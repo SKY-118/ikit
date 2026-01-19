@@ -289,15 +289,13 @@ def transcribe_with_whisperx(audio_path, language="en", device="mps"):
         audio
     )
 
-    # 5. Convert to FunASR format
+    # 5. Convert to FunASR format (without word-level timestamps)
     sentences = []
     for seg in result["segments"]:
-        # Convert milliseconds to match FunASR format
         sentences.append({
             "text": seg["text"].strip(),
             "start": int(seg["start"] * 1000),  # Convert to ms
             "end": int(seg["end"] * 1000),
-            "timestamp": [[int(w["start"] * 1000), int(w["end"] * 1000)] for w in seg["words"]],
             "spk": 0 if seg["speaker"] == "SPEAKER_00" else 1,
             "speaker": "Remote" if seg["speaker"] == "SPEAKER_00" else "Local"
         })
@@ -337,7 +335,7 @@ def transcribe_with_mlx(audio_path, language="en", model="mlx-community/whisper-
         detected_lang = result["language"]
         logger.info(f"🌐 Detected language: {detected_lang} ({_get_language_name(detected_lang)})")
 
-    # Convert to FunASR format with basic speaker labels
+    # Convert to FunASR format with basic speaker labels (no timestamps)
     sentences = []
     for i, seg in enumerate(result.get("segments", [])):
         # Basic speaker detection: alternate between speakers
@@ -345,16 +343,10 @@ def transcribe_with_mlx(audio_path, language="en", model="mlx-community/whisper-
         speaker_label = "SPEAKER_00" if i % 2 == 0 else "SPEAKER_01"
         speaker_name = "Remote" if i % 2 == 0 else "Local"
 
-        # Build timestamps from word-level data
-        timestamps = []
-        if "words" in seg:
-            timestamps = [[int(w["start"] * 1000), int(w["end"] * 1000)] for w in seg["words"]]
-
         sentences.append({
             "text": seg["text"].strip(),
             "start": int(seg["start"] * 1000),
             "end": int(seg["end"] * 1000),
-            "timestamp": timestamps,
             "spk": 0 if i % 2 == 0 else 1,
             "speaker": speaker_name
         })
@@ -685,6 +677,12 @@ def transcribe_dual_track(mic_path, sys_path, model, device):
 
     # Combine transcripts by timestamp
     combined = combine_transcripts(sys_transcript, mic_transcript)
+
+    # Remove timestamp arrays from all sentences (FunASR includes them by default)
+    if 'sentence_info' in combined:
+        for sent in combined['sentence_info']:
+            if 'timestamp' in sent:
+                del sent['timestamp']
 
     return combined
 

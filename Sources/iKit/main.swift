@@ -10,6 +10,25 @@ import AVFoundation
 import AudioToolbox
 import IOKit
 
+// MARK: - IOKit Power Management Declarations
+typealias IOPMAssertionID = UInt32
+typealias IOPMAssertionLevel = UInt32
+
+let kIOPMAssertionTypePreventUserIdleSystemSleep: CFString = "PreventUserIdleSystemSleep" as CFString
+let kIOPMAssertionLevelOn: IOPMAssertionLevel = 255
+let kIOPMAssertionLevelOff: IOPMAssertionLevel = 0
+
+@_silgen_name("IOPMAssertionCreateWithName")
+func IOPMAssertionCreateWithName(
+    _ AssertionType: CFString,
+    _ AssertionName: CFString,
+    _ AssertionLevel: IOPMAssertionLevel,
+    _ AssertionID: UnsafeMutablePointer<IOPMAssertionID>
+) -> IOReturn
+
+@_silgen_name("IOPMAssertionRelease")
+func IOPMAssertionRelease(_ AssertionID: IOPMAssertionID) -> IOReturn
+
 // MARK: - Global Signal Handling
 /// Global flag for graceful shutdown (non-isolated)
 nonisolated(unsafe) var isShuttingDown = false
@@ -39,14 +58,17 @@ struct Logger {
 
     /// 初始化日志文件（在指定目录）
     static func setupLogging(outputDir: String? = nil) {
+        // 生成带日期的日志文件名
+        let logFileName = "ikit-\(beijingDate()).log"
+
         // 确定日志文件位置
         let logPath: String
         if let dir = outputDir {
-            logPath = URL(fileURLWithPath: dir).appendingPathComponent("ikit.log").path
+            logPath = URL(fileURLWithPath: dir).appendingPathComponent(logFileName).path
         } else {
-            // 默认位置 ~/recordings/ikit.log
+            // 默认位置 ~/recordings/ikit-YYYY-MM-DD.log
             let home = FileManager.default.homeDirectoryForCurrentUser.path
-            logPath = URL(fileURLWithPath: home + "/recordings").appendingPathComponent("ikit.log").path
+            logPath = URL(fileURLWithPath: home + "/recordings").appendingPathComponent(logFileName).path
         }
 
         // 确保目录存在
@@ -127,6 +149,15 @@ func beijingDateTime() -> String {
     return formatter.string(from: Date())
 }
 
+/// 生成 UTC+8 格式的日期（用于 daily 文件夹）
+/// 格式：YYYY-MM-DD（例如：2025-01-16）
+func beijingDate() -> String {
+    let formatter = DateFormatter()
+    formatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600)  // UTC+8
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.string(from: Date())
+}
+
 // MARK: - Config
 struct Config: Codable {
     var notes_root: String?
@@ -134,13 +165,17 @@ struct Config: Codable {
     var transcribe_script: String?
     var ollama_url: String?
     var ollama_model: String?
+    var litellm_url: String?
+    var litellm_api_key: String?
+    var litellm_model: String?
+    var litellm_vision_model: String?
     var screenshot_interval: Double?
 }
 
 class ConfigManager {
     static let shared = ConfigManager()
     var current: Config
-    
+
     private init() {
         self.current = Config(
             notes_root: nil,
@@ -148,11 +183,15 @@ class ConfigManager {
             transcribe_script: nil,
             ollama_url: "http://localhost:11434/api/generate",
             ollama_model: "qwen2.5:14b",
+            litellm_url: "http://localhost:4444/v1/completions",
+            litellm_api_key: nil,
+            litellm_model: "qwen-max",
+            litellm_vision_model: "qwen3-vl-30b",
             screenshot_interval: 10.0
         )
         load()
     }
-    
+
     func load() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let path = home.appendingPathComponent(".config/ikit/config.json")
@@ -161,7 +200,7 @@ class ConfigManager {
             self.current = decoded
         }
     }
-    
+
     func save() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let dir = home.appendingPathComponent(".config/ikit")
@@ -280,8 +319,7 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: inputFormat.sampleRate,
                 AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateKey: 64000,
-                AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue
+                AVEncoderBitRateKey: 64000
             ])
         } catch {
             Logger.error("Failed to create audio file: \(error)")
@@ -322,36 +360,24 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         let inputNode = engine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
         Logger.debug("Input format: \(inputFormat)")
+        Logger.info("   Channels: \(inputFormat.channelCount), Sample rate: \(inputFormat.sampleRate)")
 
-        let mixer = AVAudioMixerNode()
-        mixerNode = mixer
-        engine.attach(mixer)
-        engine.connect(inputNode, to: mixer, format: inputFormat)
-
-        guard let fileFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: inputFormat.sampleRate,
-            channels: 1,
-            interleaved: false
-        ) else {
-            Logger.error("Failed to create recording format")
-            return
-        }
-
+        // Create file for recording
         do {
             audioFile = try AVAudioFile(forWriting: outputURL, settings: [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: inputFormat.sampleRate,
-                AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateKey: 64000,
-                AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue
+                AVNumberOfChannelsKey: inputFormat.channelCount,
+                AVEncoderBitRateKey: 64000
             ])
         } catch {
             Logger.error("Failed to create audio file: \(error)")
             return
         }
 
-        mixer.installTap(onBus: 0, bufferSize: 8192, format: fileFormat) { [weak self] buffer, time in
+        // Install tap directly on input node with its native format
+        // This avoids format conversion issues that can cause silence
+        inputNode.installTap(onBus: 0, bufferSize: 8192, format: inputFormat) { [weak self] buffer, time in
             guard let self = self, let file = self.audioFile else { return }
             do {
                 try file.write(from: buffer)
@@ -364,6 +390,7 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
             try engine.start()
             Logger.info("✅ MicRecorder: Recording started (no AEC)")
             Logger.info("   Sample rate: \(inputFormat.sampleRate) Hz")
+            Logger.info("   Channels: \(inputFormat.channelCount)")
             Logger.info("   Bit rate: 64kbps (speech optimized)")
             Logger.info("   AEC: Disabled (external audio output)")
         } catch {
@@ -373,11 +400,16 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
 
     func stop() {
         if let engine = audioEngine {
-            // Remove tap first to stop receiving audio buffers
+            // Remove tap from input node (used by startSimple)
+            engine.inputNode.removeTap(onBus: 0)
+            Logger.info("🎙️ MicRecorder: Audio tap removed from input node")
+
+            // Remove tap from mixer if used (used by startWithAEC)
             if let mixer = mixerNode {
                 mixer.removeTap(onBus: 0)
-                Logger.info("🎙️ MicRecorder: Audio tap removed")
+                Logger.info("🎙️ MicRecorder: Audio tap removed from mixer")
             }
+
             // Then stop the engine
             engine.stop()
             Logger.info("🎙️ MicRecorder: Audio engine stopped")
@@ -403,6 +435,8 @@ struct ScreenshotMetadata: Codable {
     let timestamp: Int
     let path: String
     var ocrText: String
+    var ocrDelta: String  // Incremental text (new since last screenshot)
+    var ocrHash: String   // Perceptual hash for deduplication
     var names: [String]
 }
 
@@ -414,6 +448,8 @@ class SystemRecorder: NSObject, SCStreamOutput {
     private var startTime: CMTime?
     private var recordingStartTime: Date?
     private var lastScreenshotTime = Date()
+    private var lastScreenshotHash: String = ""  // For delta OCR
+    private var lastOcrText: String = ""  // Previous OCR text for delta
     private var outputDir: String = ""
     private var audioSampleCount = 0
     private var screenFrameCount = 0
@@ -443,6 +479,8 @@ class SystemRecorder: NSObject, SCStreamOutput {
         self.startTime = nil
         self.recordingStartTime = nil
         self.outputDir = outputURL.deletingLastPathComponent().path
+        self.lastScreenshotHash = ""
+        self.lastOcrText = ""
         Logger.info("🎬 SystemRecorder: Starting...")
 
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -468,10 +506,31 @@ class SystemRecorder: NSObject, SCStreamOutput {
             Logger.info("   Looking for: \(keywords)...")
         }
 
-        // Jeff: 强制使用全屏捕获，不使用窗口过滤
-        // 这确保捕获所有系统音频，不管来源是哪个应用
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-        Logger.info("🎬 SystemRecorder: Using FULL SCREEN capture (all apps audio included)")
+        // 智能捕获模式：检测到 calling app 时只捕获该应用，否则全屏
+        let filter: SCContentFilter
+        if !callingWindows.isEmpty {
+            // 获取 calling app 的应用对象
+            let callingApps = Set(callingWindows.compactMap { $0.owningApplication })
+
+            // 创建只包含 calling app 的 filter
+            // 注意：macOS 14+ 可以直接指定要包含的应用
+            if #available(macOS 14.0, *) {
+                // 使用新的 API 只捕获特定应用
+                let otherApps = content.applications.filter { app in
+                    !callingApps.contains(where: { $0.bundleIdentifier == app.bundleIdentifier })
+                }
+                filter = SCContentFilter(display: display, excludingApplications: otherApps, exceptingWindows: [])
+                Logger.info("🎬 SystemRecorder: Using APP-SPECIFIC capture (only calling app audio)")
+            } else {
+                // macOS 13 回退到全屏
+                filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+                Logger.warn("⚠️  macOS 13 detected, falling back to FULL SCREEN capture")
+            }
+        } else {
+            // 没有检测到 calling app，使用全屏捕获
+            filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            Logger.info("🎬 SystemRecorder: Using FULL SCREEN capture (all apps audio included)")
+        }
 
         let config = SCStreamConfiguration()
         config.capturesAudio = true
@@ -512,7 +571,7 @@ class SystemRecorder: NSObject, SCStreamOutput {
         try await stream?.startCapture()
         Logger.info("✅ SystemRecorder: Capture started successfully")
     }
-    
+
     func stop() async {
         Logger.info("🎬 SystemRecorder: Stopping capture...")
         try? await stream?.stopCapture()
@@ -588,7 +647,7 @@ class SystemRecorder: NSObject, SCStreamOutput {
             Logger.warn("Failed to save metadata.json: \(error)")
         }
     }
-    
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         if type == .audio {
             audioSampleCount += 1
@@ -613,7 +672,7 @@ class SystemRecorder: NSObject, SCStreamOutput {
             }
         }
     }
-    
+
     private func saveScreenshot(buffer: CMSampleBuffer) {
         guard let cv = CMSampleBufferGetImageBuffer(buffer) else { return }
         let ci = CIImage(cvImageBuffer: cv)
@@ -631,20 +690,45 @@ class SystemRecorder: NSObject, SCStreamOutput {
         // Use relative time (seconds from recording start) for metadata
         let relativeTimestamp = recordingStartTime.map { Int(Date().timeIntervalSince($0)) } ?? 0
 
-        // Create metadata entry
-        let metadata = ScreenshotMetadata(timestamp: relativeTimestamp, path: url.path, ocrText: "", names: [])
+        // Create metadata entry with new fields
+        let metadata = ScreenshotMetadata(
+            timestamp: relativeTimestamp,
+            path: url.path,
+            ocrText: "",
+            ocrDelta: "",
+            ocrHash: "",
+            names: []
+        )
         screenshots.append(metadata)
 
-        // Launch OCR task asynchronously
+        // Launch OCR task asynchronously with delta compression
         let task = Task {
+            // Compute perceptual hash for similarity detection
+            let imageHash = computePerceptualHash(imagePath: url.path)
+
+            // Check if image is similar to previous one
+            let isSimilarToPrevious = !lastScreenshotHash.isEmpty && hashesSimilar(imageHash, lastScreenshotHash)
+
+            // Always OCR, but use delta compression
             let ocrText = await performOCR(on: url.path)
+            let ocrDelta = isSimilarToPrevious ? computeDelta(currentText: ocrText, previousText: lastOcrText) : ""
+
             let names = extractNames(from: ocrText)
+
             await MainActor.run {
                 if let index = self.screenshots.firstIndex(where: { $0.timestamp == relativeTimestamp }) {
                     self.screenshots[index].ocrText = ocrText
+                    self.screenshots[index].ocrDelta = ocrDelta
+                    self.screenshots[index].ocrHash = imageHash
                     self.screenshots[index].names = names
                 }
-                Logger.debug("🔍 OCR completed for shot_\(fileTimestamp): \(ocrText.prefix(50))...")
+
+                // Update state for next comparison
+                self.lastScreenshotHash = imageHash
+                self.lastOcrText = ocrText
+
+                let deltaPreview = ocrDelta.isEmpty ? "" : " | Δ: \(ocrDelta.prefix(30))..."
+                Logger.debug("🔍 OCR completed for shot_\(fileTimestamp): \(ocrText.prefix(30))...\(deltaPreview)")
             }
         }
         ocrTasks.append(task)
@@ -673,6 +757,77 @@ class SystemRecorder: NSObject, SCStreamOutput {
             request.recognitionLevel = .accurate
             try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
         }
+    }
+
+    // MARK: - OCR Delta Compression
+
+    /// Compute perceptual hash of image for similarity detection
+    private func computePerceptualHash(imagePath: String) -> String {
+        guard let imageSource = CGImageSourceCreateWithURL(URL(fileURLWithPath: imagePath) as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else { return "" }
+
+        // Resize to 8x8 for simple hash (faster than full perceptual hash)
+        let width = 8
+        let height = 8
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let context = CGContext(data: nil,
+                                      width: width,
+                                      height: height,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: width,
+                                      space: colorSpace,
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return "" }
+
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let pixels = context.data?.bindMemory(to: UInt8.self, capacity: width * height) else { return "" }
+
+        // Compute average and generate hash
+        var sum = 0
+        for i in 0..<(width * height) {
+            sum += Int(pixels[i])
+        }
+        let avg = sum / (width * height)
+
+        var hash = ""
+        for i in 0..<(width * height) {
+            hash += pixels[i] > avg ? "1" : "0"
+        }
+        return hash
+    }
+
+    /// Compute delta between current and previous OCR text
+    private func computeDelta(currentText: String, previousText: String) -> String {
+        guard !previousText.isEmpty else { return currentText }
+
+        let currentWords = Set(currentText.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty })
+        let previousWords = Set(previousText.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty })
+
+        // Find new words (in current but not in previous)
+        let newWords = currentWords.subtracting(previousWords)
+
+        // Also find removed words (for context)
+        let removedWords = previousWords.subtracting(currentWords)
+
+        var deltaParts: [String] = []
+        if !newWords.isEmpty {
+            deltaParts.append("+ " + Array(newWords.sorted()).joined(separator: " "))
+        }
+        if !removedWords.isEmpty && removedWords.count < 20 {  // Only track removals if not too many
+            deltaParts.append("- " + Array(removedWords.sorted()).joined(separator: " "))
+        }
+
+        return deltaParts.isEmpty ? "" : deltaParts.joined(separator: " | ")
+    }
+
+    /// Check if two hashes are similar (Hamming distance)
+    private func hashesSimilar(_ hash1: String, _ hash2: String, threshold: Int = 10) -> Bool {
+        guard hash1.count == hash2.count else { return false }
+        var distance = 0
+        for (c1, c2) in zip(hash1, hash2) where c1 != c2 {
+            distance += 1
+            if distance > threshold { return false }
+        }
+        return true
     }
 }
 
@@ -1017,9 +1172,12 @@ class Daemon {
     private var cancellableTask: Task<Void, Never>?
     private let mode: RecordingMode
     private var powerAssertionID: IOPMAssertionID = 0
+    private let segmentDuration: UInt64  // Segment duration in nanoseconds
+    private var processedSegments: Set<String> = []  // Track processed segments to prevent duplicate transcription
 
-    init(mode: RecordingMode = .both) {
+    init(mode: RecordingMode = .both, segmentMinutes: Int = 15) {
         self.mode = mode
+        self.segmentDuration = UInt64(segmentMinutes * 60 * 1_000_000_000)
     }
 
     // MARK: - Power Management (防止睡眠)
@@ -1043,21 +1201,29 @@ class Daemon {
     }
 
     func run(outputDir: String) async {
-        // Setup logging to file
-        Logger.setupLogging(outputDir: outputDir)
+        // Create/get daily folder (UTC+8)
+        let dailyFolderName = beijingDate()
+        let dailyDir = URL(fileURLWithPath: outputDir).appendingPathComponent(dailyFolderName).path
+
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: dailyDir, withIntermediateDirectories: true)
+
+        // Setup logging to file in daily folder
+        Logger.setupLogging(outputDir: dailyDir)
         defer {
             Logger.closeLogging()
             allowSleep()
         }
 
-        Logger.info("👻 Daemon started. Output: \(outputDir)")
+        Logger.info("👻 Daemon started. Output: \(dailyDir)")
 
         // Prevent system sleep
-        if preventSleep() {
-            Logger.info("⚡ Sleep prevention enabled")
-        } else {
-            Logger.warn("⚠️ Failed to enable sleep prevention")
-        }
+        // TODO: IOKit sleep prevention causes issues, disabled for now
+        // if preventSleep() {
+        //     Logger.info("⚡ Sleep prevention enabled")
+        // } else {
+        //     Logger.warn("⚠️ Failed to enable sleep prevention")
+        // }
 
         // Show recording mode
         switch mode {
@@ -1071,13 +1237,12 @@ class Daemon {
         }
 
         Logger.info("Press Ctrl+\\ to stop recording and save files")
-        Logger.info("⚠️  Files will be auto-saved every 15 minutes")
+        let intervalMinutes = segmentDuration / 60 / 1_000_000_000
+        Logger.info("⚠️  Files will be auto-saved every \(intervalMinutes) minutes")
         Logger.info("⚠️  Wait for 'All recordings saved and finalized' before force quitting")
-        let fm = FileManager.default
-        try? fm.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
 
-        // Run the main loop
-        await runLoop(outputDir: outputDir, fm: fm)
+        // Run the main loop with daily directory
+        await runLoop(outputDir: dailyDir, fm: fm)
 
         // Normal exit cleanup
         Logger.info("✅ All recordings saved and finalized")
@@ -1182,8 +1347,8 @@ class Daemon {
                 try? await sys.start(outputURL: sysPath)
             }
 
-            // 15 mins block with periodic shutdown checks (1 second intervals)
-            let totalDuration: UInt64 = 900 * 1_000_000_000  // 15 minutes in nanoseconds
+            // Segment duration with periodic shutdown checks (1 second intervals)
+            let totalDuration: UInt64 = segmentDuration  // Configurable segment duration
             let checkInterval: UInt64 = 1_000_000_000        // 1 second in nanoseconds
             var elapsed: UInt64 = 0
 
@@ -1254,6 +1419,21 @@ class Daemon {
 
     private func processSegment(micPath: URL, sysPath: URL, finalPath: URL, fm: FileManager) {
         queue.async {
+            // Create unique identifier for this segment
+            let segmentId = finalPath.lastPathComponent
+
+            // Check if already processed to prevent duplicate transcription
+            defer {
+                // Mark as processed regardless of success/failure
+                self.processedSegments.insert(segmentId)
+            }
+
+            // Skip if already processed
+            if self.processedSegments.contains(segmentId) {
+                Logger.info("⏭️  Segment \(segmentId) already processed, skipping transcription")
+                return
+            }
+
             // Merge logic based on mode
             let ffmpeg = "/usr/local/bin/ffmpeg"
 
@@ -1280,7 +1460,8 @@ class Daemon {
 
             Logger.info("✅ Saved: \(finalPath.lastPathComponent)")
 
-            // ⭐ Auto-process: Trigger transcription for each audio file
+            // ⭐ Auto-process: Always trigger, even during shutdown
+            // Transcription runs in background, independent of recording lifecycle
             Task {
                 await self.autoProcessRecordings(filesToProcess, outputDir: finalPath.deletingLastPathComponent().path)
             }
@@ -1288,6 +1469,7 @@ class Daemon {
     }
 
     // MARK: - Auto-processing (自动转录)
+    // Runs in background, independent of recording lifecycle
     private func autoProcessRecordings(_ files: [URL], outputDir: String) async {
         let configManager = ConfigManager.shared
 
@@ -1297,42 +1479,110 @@ class Daemon {
             return
         }
 
-        for audioFile in files {
+        // Handle dual-track (2 files) or single-track (1 file)
+        if files.count == 2 {
+            // Dual-track: both mic and sys files
+            let micPath = files.first { $0.path.contains("_mic.") } ?? files[0]
+            let sysPath = files.first { $0.path.contains("_sys.") } ?? files[1]
+
+            // Output based on timestamp (strip _mic or _sys suffix)
+            let timestamp = micPath.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_mic", with: "")
+            let out = URL(fileURLWithPath: outputDir).appendingPathComponent("\(timestamp).json")
+
+            // Check if already transcribed
+            if FileManager.default.fileExists(atPath: out.path) {
+                Logger.info("⏭️  Already transcribed: \(timestamp)")
+                return
+            }
+
+            Logger.info("🎤 Auto-transcribing dual-track: \(micPath.lastPathComponent) + \(sysPath.lastPathComponent)")
+
+            let result = Shell.run(python, args: [script, micPath.path, sysPath.path, "--output", out.path])
+
+            if result.exitCode == 0 {
+                Logger.info("✅ Transcription complete: \(out.lastPathComponent)")
+                await processSummaryIfNeeded(result: result, output: out, configManager: configManager, outputDir: outputDir)
+            } else {
+                Logger.error("❌ Transcription failed for \(timestamp)")
+            }
+        } else if files.count == 1 {
+            // Single-track: only one file
+            let audioFile = files[0]
             let out = audioFile.deletingPathExtension().appendingPathExtension("json")
 
             // Check if already transcribed
             if FileManager.default.fileExists(atPath: out.path) {
                 Logger.info("⏭️  Already transcribed: \(audioFile.lastPathComponent)")
-                continue
+                return
             }
 
             Logger.info("🎤 Auto-transcribing: \(audioFile.lastPathComponent)")
 
             let result = Shell.run(python, args: [script, audioFile.path, "--output", out.path])
 
-            if result.terminationStatus == 0 {
+            if result.exitCode == 0 {
                 Logger.info("✅ Transcription complete: \(out.lastPathComponent)")
-
-                // Check if Ollama is available for summarization
-                if let ollamaURL = configManager.current.ollama_url,
-                   let url = URL(string: ollamaURL) {
-                    // Simple connectivity check
-                    var request = URLRequest(url: url)
-                    request.httpMethod = "HEAD"
-                    request.timeoutInterval = 2
-
-                    if let (_, response) = try? await URLSession.shared.data(for: request),
-                       let httpResponse = response as? HTTPURLResponse,
-                       httpResponse.statusCode == 200 {
-                        Logger.info("🤖 Ollama available, processing summary...")
-
-                        // Use SecretaryTool to process
-                        let secretary = SecretaryTool()
-                        await secretary.process(files: [out.path], outputDir: outputDir)
-                    }
-                }
+                await processSummaryIfNeeded(result: result, output: out, configManager: configManager, outputDir: outputDir)
             } else {
                 Logger.error("❌ Transcription failed for: \(audioFile.lastPathComponent)")
+            }
+        } else {
+            Logger.warn("⚠️  No audio files to process")
+        }
+    }
+
+    // Helper function to process summary if LLM is available
+    private func processSummaryIfNeeded(result: (output: String?, error: String?, exitCode: Int32), output: URL, configManager: ConfigManager, outputDir: String) async {
+        // Check if LiteLLM (unified API) or Ollama is available for summarization
+        var llmURL: String? = nil
+        var llmType = ""
+
+        // Try LiteLLM first (if configured)
+        if let litellmUrlConfig = configManager.current.litellm_url,
+           let litellmUrl = URL(string: "\(litellmUrlConfig)/health/liveliness") {
+            var request = URLRequest(url: litellmUrl)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 2
+
+            if let apiKey = configManager.current.litellm_api_key, !apiKey.isEmpty {
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            }
+
+            if let (data, _) = try? await URLSession.shared.data(for: request),
+               let response = String(data: data, encoding: .utf8),
+               response.contains("I'm alive") {
+                llmURL = litellmUrlConfig
+                llmType = "LiteLLM"
+                Logger.info("🤖 LiteLLM available, processing summary...")
+            }
+        }
+
+        // Fallback to Ollama if LiteLLM not available
+        if llmURL == nil {
+            llmURL = configManager.current.ollama_url
+            llmType = "Ollama"
+            Logger.info("🤖 Ollama available, processing summary...")
+        }
+
+        if let url = llmURL, let apiUrl = URL(string: url) {
+            // Simple connectivity check
+            var request = URLRequest(url: apiUrl)
+            request.httpMethod = "HEAD"
+            request.timeoutInterval = 2
+
+            // Add API key if available
+            if let apiKey = configManager.current.litellm_api_key, !apiKey.isEmpty, llmType == "LiteLLM" {
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            }
+
+            if let (_, response) = try? await URLSession.shared.data(for: request),
+               let httpResponse = response as? HTTPURLResponse,
+               httpResponse.statusCode == 200 || httpResponse.statusCode == 401 {  // 401 = service up but needs auth
+                Logger.info("🤖 \(llmType) available, processing summary...")
+
+                // Use SecretaryTool to process
+                let secretary = SecretaryTool()
+                await secretary.process(files: [output.path], outputDir: outputDir)
             }
         }
     }
@@ -1345,7 +1595,7 @@ class NotesBridge: NSObject {
 
     private func executeAppleScript(_ script: String) -> String? {
         let appleScript = NSAppleScript(source: script)
-        var error: NSDictionary? 
+        var error: NSDictionary?
         let output = appleScript?.executeAndReturnError(&error)
         if let err = error {
             Logger.debug("AppleScript Error: \(err)")
@@ -1362,14 +1612,22 @@ class NotesBridge: NSObject {
 
     func listAllNotesSafe() -> [(id: String, name: String, path: String, modDate: Date?)] {
         guard let countStr = executeAppleScript("tell application \"Notes\" to count of notes"),
-              let total = Int(countStr) else { return [] } 
-        
+              let total = Int(countStr) else { return [] }
+
         Logger.info("🔍 Scanning \(total) notes (Safe Mode)...")
         var results: [(String, String, String, Date?)] = []
         let f = DateFormatter(); f.dateFormat = "yyyy-M-d H:m:s"
-        
+        let startTime = Date()
+
         for i in 1...total {
-            if i % 10 == 0 { print(".", terminator: ""); fflush(stdout) }
+            // 进度日志：每 50 条或最后一条时输出
+            if i % 50 == 0 || i == total {
+                let percent = Int((Double(i) / Double(total)) * 100)
+                let elapsed = Int(Date().timeIntervalSince(startTime))
+                let avgTime = Double(elapsed) / Double(i)
+                let remaining = Int(avgTime * Double(total - i))
+                Logger.info("   Progress: \(i)/\(total) (\(percent)%) - \(remaining)s remaining")
+            }
             let script = """
 tell application \"Notes\"
     try
@@ -1378,7 +1636,7 @@ tell application \"Notes\"
         set nname to name of n
         set d to modification date of n
         set dStr to (year of d as string) & "-" & (month of d as integer as string) & "-" & (day of d as string) & " " & (hours of d as string) & ":" & (minutes of d as string) & ":" & (seconds of d as string)
-        
+
         set folderPath to \"Root\"
         try
             set folderPath to name of container of n
@@ -1393,7 +1651,7 @@ tell application \"Notes\"
                 end if
             end repeat
         end try
-        
+
         return nid & \"|||\" & nname & \"|||\" & folderPath & \"|||\" & dStr
     on error
         return ""
@@ -1407,7 +1665,7 @@ end tell
                 }
             }
         }
-        print("\n")
+        Logger.info("✅ Scan complete: \(results.count) notes")
         return results
     }
 
@@ -1432,7 +1690,7 @@ tell application \"Notes\"
             set nname to name of n
             set d to modification date of n
             set dStr to (year of d as string) & "-" & (month of d as integer as string) & "-" & (day of d as string) & " " & (hours of d as string) & ":" & (minutes of d as string) & ":" & (seconds of d as string)
-            
+
             set currentFolder to container of n
             set folderPath to name of currentFolder
             repeat while container of currentFolder is not missing value
@@ -1454,15 +1712,15 @@ tell application \"Notes\"
 end tell
 """
         guard let out = executeAppleScript(script) else { return [] }
-        if out.starts(with: "Error:") { Logger.debug(out); return [] } 
-        
+        if out.starts(with: "Error:") { Logger.debug(out); return [] }
+
         let f = DateFormatter(); f.dateFormat = "yyyy-M-d H:m:s"
         return out.components(separatedBy: "###").filter{!$0.isEmpty}.compactMap { item in
             let p = item.components(separatedBy: "|||")
             return p.count >= 4 ? (p[0], p[1], p[2], f.date(from: p[3])) : nil
         }
     }
-    
+
     func listFoldersWithIds() -> [(id: String, path: String)] {
         let script = """
 tell application \"Notes\"
@@ -1489,18 +1747,18 @@ tell application \"Notes\"
     return resultList as string
 end tell
 """
-        guard let output = executeAppleScript(script) else { return [] } 
+        guard let output = executeAppleScript(script) else { return [] }
         return output.components(separatedBy: "###").filter{!$0.isEmpty}.compactMap {
             let p = $0.components(separatedBy: "|||")
             return p.count >= 2 ? (p[0], p[1]) : nil
         }
     }
-    
+
     func listNotesMetadata(inFolderId folderId: String) -> [(name: String, modDate: Date?)] {
         let script = """
 tell application \"Notes\"
     try
-        set targetFolder to folder id \"\(folderId)\" 
+        set targetFolder to folder id \"\(folderId)\"
         set noteList to every note in targetFolder
         set resultList to {}
         repeat with n in noteList
@@ -1515,7 +1773,7 @@ tell application \"Notes\"
     end try
 end tell
 """
-        guard let output = executeAppleScript(script) else { return [] } 
+        guard let output = executeAppleScript(script) else { return [] }
         let f = DateFormatter(); f.dateFormat = "yyyy-M-d H:m:s"
         return output.components(separatedBy: "###").filter{!$0.isEmpty}.compactMap {
             let p = $0.components(separatedBy: "|||")
@@ -1530,13 +1788,13 @@ end tell
         let escName = escape(name)
         return executeAppleScript("tell application \"Notes\" to get plaintext of first note in folder id \"\(folderId)\" whose name is \"\(escName)\"" )
     }
-    
+
     func createNote(name: String, folderId: String, content: String) -> String {
         let escName = escape(name); let escContent = escape(content)
         let script = """
 tell application \"Notes\"
     try
-        set targetFolder to folder id \"\(folderId)\" 
+        set targetFolder to folder id \"\(folderId)\"
         make new note at targetFolder with properties {name:\"\(escName)\", body:\"\(escContent)\"}
         return \"success\"
     on error err
@@ -1546,7 +1804,7 @@ end tell
 """
         return executeAppleScript(script) ?? "Error: Script failed"
     }
-    
+
     func appendToNote(name: String, folderId: String, content: String) -> String {
         let escName = escape(name)
         let bs = String(Character(UnicodeScalar(92)!))
@@ -1554,8 +1812,8 @@ end tell
         let script = """
 tell application \"Notes\"
     try
-        set theNote to first note in folder id \"\(folderId)\" whose name is \"\(escName)\" 
-        set body of theNote to (body of theNote) & "<br>" & \"\(escContent)\" 
+        set theNote to first note in folder id \"\(folderId)\" whose name is \"\(escName)\"
+        set body of theNote to (body of theNote) & "<br>" & \"\(escContent)\"
         return \"success\"
     on error err
         return \"Error: \" & err
@@ -1564,7 +1822,7 @@ end tell
 """
         return executeAppleScript(script) ?? "Error: Script failed"
     }
-    
+
     func updateNote(name: String, folderId: String, content: String) -> String {
         let escName = escape(name)
         let bs = String(Character(UnicodeScalar(92)!))
@@ -1572,8 +1830,8 @@ end tell
         let script = """
 tell application \"Notes\"
     try
-        set theNote to first note in folder id \"\(folderId)\" whose name is \"\(escName)\" 
-        set body of theNote to \"\(escContent)\" 
+        set theNote to first note in folder id \"\(folderId)\" whose name is \"\(escName)\"
+        set body of theNote to \"\(escContent)\"
         return \"success\"
     on error err
         return \"Error: \" & err
@@ -1582,7 +1840,7 @@ end tell
 """
         return executeAppleScript(script) ?? "Error: Script failed"
     }
-    
+
     func deleteNote(name: String, folderId: String) -> String {
         let escName = escape(name)
         let script = """
@@ -1603,21 +1861,21 @@ end tell
 class NotesTool {
     let bridge = NotesBridge.shared
     let fm = FileManager.default
-    
+
     func sync(targetDir: String) {
         Logger.info("🧠 Smart Sync to: \(targetDir)")
         try? fm.createDirectory(atPath: targetDir, withIntermediateDirectories: true)
         let timeFile = (targetDir as NSString).appendingPathComponent(".last_sync_time")
         var lastSync = Date(timeIntervalSince1970: 0)
         let hasHistory = fm.fileExists(atPath: timeFile)
-        
+
         if hasHistory, let ts = try? String(contentsOfFile: timeFile, encoding: .utf8),
            let t = TimeInterval(ts.trimmingCharacters(in: .whitespacesAndNewlines)) {
             lastSync = Date(timeIntervalSince1970: t)
         }
-        
+
         let notes: [(id: String, name: String, path: String, modDate: Date?)]
-        
+
         if !hasHistory {
             Logger.info("🐢 First run detected. Using Safe Scan (this may take a while)...")
             notes = bridge.listAllNotesSafe()
@@ -1626,22 +1884,22 @@ class NotesTool {
             Logger.info("🚀 Incremental check since: \(checkDate)")
             notes = bridge.listRecentlyModified(since: checkDate)
         }
-        
+
         if !notes.isEmpty {
             Logger.info("⚡️ Syncing \(notes.count) notes...")
             for (nid, name, folderPath, _) in notes {
                 let folderName = folderPath.isEmpty ? "Unknown" : folderPath
                 let fullFolderPath = (targetDir as NSString).appendingPathComponent(folderName)
                 try? fm.createDirectory(atPath: fullFolderPath, withIntermediateDirectories: true)
-                
+
                 // Use Short ID in filename to prevent collisions
                 let shortId = String(nid.suffix(8)).replacingOccurrences(of: "/", with: "-")
                 let safeName = name.replacingOccurrences(of: "/", with: ":")
                 let filename = "\(safeName) [\(shortId)].md"
                 let filePath = (fullFolderPath as NSString).appendingPathComponent(filename)
-                
+
                 Logger.info("  ⬇️ [\(folderName)] \(name)")
-                
+
                 if fm.fileExists(atPath: filePath) { try? fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: filePath) }
                 if let content = bridge.readNote(id: nid) {
                     try? content.write(toFile: filePath, atomically: true, encoding: String.Encoding.utf8)
@@ -1651,12 +1909,12 @@ class NotesTool {
         } else { Logger.info("✅ Up to date.") }
         try? String(Date().timeIntervalSince1970).write(toFile: timeFile, atomically: true, encoding: String.Encoding.utf8)
     }
-    
+
     func findFolderId(path: String) -> String? {
         let folders = bridge.listFoldersWithIds()
         return folders.first(where: { $0.path == path })?.id ?? folders.first(where: { $0.path.hasSuffix(path) })?.id
     }
-    
+
     func create(targetDir: String, folder: String, title: String, content: String) {
         guard let fid = findFolderId(path: folder) else { Logger.error("Folder not found: \(folder)"); return }
         let res = bridge.createNote(name: title, folderId: fid, content: content)
@@ -1698,11 +1956,15 @@ class RemindersTool {
         return false
     }
     func listTasks(json: Bool = false) async {
-        guard await checkPermission() else { return }
+        guard await checkPermission() else { Logger.error("Permission denied"); return }
         let predicate = store.predicateForReminders(in: nil)
         let items = await withCheckedContinuation { c in store.fetchReminders(matching: predicate) { r in c.resume(returning: r) } }
         guard let reminders = items else { return }
         let incomplete = reminders.filter { !$0.isCompleted }
+        if incomplete.isEmpty {
+            Logger.info("No incomplete tasks found")
+            return
+        }
         if json {
             let f = ISO8601DateFormatter()
             let dicts = incomplete.map { r -> [String: Any] in
@@ -1792,6 +2054,10 @@ class CalendarTool {
         let start = Calendar.current.startOfDay(for: Date())
         let end = Calendar.current.date(byAdding: .day, value: 7, to: start)!
         let events = store.events(matching: store.predicateForEvents(withStart: start, end: end, calendars: nil))
+        if events.isEmpty {
+            Logger.info("No events found in the next 7 days")
+            return
+        }
         if json {
             let f = ISO8601DateFormatter()
             let dicts = events.map { e -> [String: Any] in
@@ -1804,7 +2070,7 @@ class CalendarTool {
         }
     }
     func newEvent(title: String, time: String) async {
-        guard await checkPermission() else { return }
+        guard await checkPermission() else { Logger.error("Calendar access denied"); return }
         let event = EKEvent(eventStore: store)
         event.title = title; event.calendar = store.defaultCalendarForNewEvents
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm"
@@ -1814,7 +2080,7 @@ class CalendarTool {
         } else { Logger.error("Invalid Time") }
     }
     func deleteEvent(title: String) async {
-        guard await checkPermission() else { return }
+        guard await checkPermission() else { Logger.error("Calendar access denied"); return }
         let start = Date(); let end = Calendar.current.date(byAdding: .day, value: 30, to: start)!
         if let e = store.events(matching: store.predicateForEvents(withStart: start, end: end, calendars: nil)).first(where: { $0.title == title }) {
             try? store.remove(e, span: .thisEvent); Logger.info("✅ Deleted")
@@ -1867,9 +2133,9 @@ class PhotoTool {
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in c.resume(returning: s == .authorized || s == .limited) }
         }
     }
-    
+
     private func fetchAssets(count: Int, screenshots: Bool, favorites: Bool) async -> [PhotoAsset] {
-        guard await checkPermission() else { return [] } 
+        guard await checkPermission() else { return [] }
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         options.fetchLimit = count
@@ -1884,7 +2150,7 @@ class PhotoTool {
         }
         return results
     }
-    
+
     func listRecent(count: Int = 10, screenshots: Bool = false, favorites: Bool = false, json: Bool = false) async {
         let assets = await fetchAssets(count: count, screenshots: screenshots, favorites: favorites)
         if json {
@@ -1894,7 +2160,7 @@ class PhotoTool {
             for r in assets { Logger.info("🖼 ID: \(r.id)") }
         }
     }
-    
+
     func batchOcr(count: Int, screenshots: Bool, favorites: Bool) async {
         let assets = await fetchAssets(count: count, screenshots: screenshots, favorites: favorites)
         if assets.isEmpty { Logger.info("No photos found."); return }
@@ -1904,17 +2170,17 @@ class PhotoTool {
             await ocr(assetId: asset.id)
         }
     }
-    
+
     func ocr(assetId: String) async {
         guard await checkPermission() else { return }
         let assets = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil)
         guard let asset = assets.firstObject else { Logger.error("Photo not found"); return }
-        
+
         let options = PHImageRequestOptions()
         options.isSynchronous = true
         options.deliveryMode = .highQualityFormat
         options.isNetworkAccessAllowed = true
-        
+
         PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
             guard let data = data, let source = CGImageSourceCreateWithData(data as CFData, nil), let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 Logger.error("Failed to load image data")
@@ -1980,49 +2246,851 @@ struct FunASRItem: Codable {
     let sentence_info: [FunASRSentence]?
 }
 
+// MARK: - Timer Tool
+class TimerTool {
+    let launchAgentsDir = FileManager.default.homeDirectoryForCurrentUser.path + "/Library/LaunchAgents"
+    let logDir = FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Logs/com.user.ikit.timer"
+
+    /// 创建定时任务
+    func create(
+        time: String,
+        date: String? = nil,
+        weekday: Int? = nil,
+        daily: Bool = false,
+        open: [String] = [],
+        with: String? = nil,
+        run: String? = nil,
+        thenRun: String? = nil,
+        terminal: String = "Ghostty",
+        title: String = "Timer",
+        message: String? = nil
+    ) {
+        // 解析时间 (HH:MM)
+        guard let (hour, minute) = parseTime(time) else {
+            Logger.error("Invalid time format. Use HH:MM (00-23:00-59)")
+            return
+        }
+
+        // 互斥检查：daily, date, weekday
+        let optionCount = (daily ? 1 : 0) + (date != nil ? 1 : 0) + (weekday != nil ? 1 : 0)
+        if optionCount > 1 {
+            Logger.error("Only one of --daily, --date, or --weekday can be specified")
+            return
+        }
+
+        // 解析日期（如果提供）
+        var targetDate: Date?
+        if let dateStr = date {
+            targetDate = parseDate(dateStr)
+            if targetDate == nil {
+                Logger.error("Invalid date format. Use YYYY-MM-DD")
+                return
+            }
+            // 验证日期不在过去
+            if let td = targetDate, !validateDate(td) {
+                Logger.error("Date must be today or in the future")
+                return
+            }
+        }
+
+        // 验证 weekday
+        if let wd = weekday, wd < 0 || wd > 6 {
+            Logger.error("Invalid weekday. Use 0-6 (0=Sun, 1=Mon, ..., 6=Sat)")
+            return
+        }
+
+        // 验证文件存在性
+        let missingFiles = validateFiles(open)
+        if !missingFiles.isEmpty {
+            Logger.error("Files not found:")
+            for file in missingFiles {
+                Logger.error("  - \(file)")
+            }
+            return
+        }
+
+        // 生成任务名称（改进版）
+        let taskName: String
+        if daily {
+            taskName = "timer-daily-\(hour)\(String(format: "%02d", minute))"
+        } else if let wd = weekday {
+            taskName = "timer-weekly-\(wd)-\(hour)\(String(format: "%02d", minute))"
+        } else {
+            // 一次性任务：默认为今天，或使用指定日期
+            let date = targetDate ?? Date()
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyyMMdd"
+            taskName = "timer-once-\(formatter.string(from: date))-\(hour)\(String(format: "%02d", minute))"
+        }
+
+        let plistFilename = "com.user.\(taskName).plist"
+        let plistPath = URL(fileURLWithPath: launchAgentsDir).appendingPathComponent(plistFilename).path
+
+        // 设置日志
+        setupLogging()
+
+        // 转义特殊字符
+        let safeTitle = escapeForAppleScript(title)
+        let safeMessage = escapeForAppleScript(message ?? "⏰ Timer: \(title)")
+
+        // 生成 AppleScript 内容
+        let script = generateAppleScript(
+            taskName: taskName,
+            title: safeTitle,
+            message: safeMessage,
+            openFiles: open,
+            openWith: with,
+            runCommand: run,
+            thenRunCommand: thenRun,
+            terminal: terminal
+        )
+
+        // 生成 plist 内容
+        let plistContent = generatePlist(
+            taskName: taskName,
+            hour: hour,
+            minute: minute,
+            day: targetDate.flatMap { Calendar.current.component(.day, from: $0) },
+            month: targetDate.flatMap { Calendar.current.component(.month, from: $0) },
+            year: targetDate.flatMap { Calendar.current.component(.year, from: $0) },
+            weekday: weekday,
+            isDaily: daily,
+            script: script
+        )
+
+        // 确保 LaunchAgents 目录存在
+        try? FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+
+        // 写入 plist 文件
+        do {
+            try plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
+            Logger.info("✅ Created: \(plistPath)")
+        } catch {
+            Logger.error("Failed to write plist: \(error)")
+            return
+        }
+
+        // 保存任务配置（供 execute 使用）
+        let taskConfig: [String: Any] = [
+            "taskName": taskName,
+            "title": title,
+            "message": message ?? "⏰ Timer: \(title)",
+            "openFiles": open,
+            "openWith": with ?? "",
+            "runCommand": run ?? "",
+            "thenRunCommand": thenRun ?? "",
+            "terminal": terminal,
+            "createdAt": ISO8601DateFormatter().string(from: Date())
+        ]
+        saveTaskConfig(taskName: taskName, config: taskConfig)
+
+        // 记录创建日志
+        log("Timer created: \(taskName)", for: taskName)
+        if daily {
+            log("Schedule: daily at \(hour):\(String(format: "%02d", minute))", for: taskName)
+        } else if let wd = weekday {
+            log("Schedule: weekly on weekday \(wd) at \(hour):\(String(format: "%02d", minute))", for: taskName)
+        } else if let td = targetDate {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd"
+            log("Schedule: once on \(formatter.string(from: td)) at \(hour):\(String(format: "%02d", minute))", for: taskName)
+        } else {
+            log("Schedule: today at \(hour):\(String(format: "%02d", minute))", for: taskName)
+        }
+
+        // 加载任务
+        loadTask(plistPath)
+    }
+
+    /// 列出所有定时任务
+    func list() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: launchAgentsDir) else {
+            Logger.info("No timers found (LaunchAgents directory: \(launchAgentsDir))")
+            return
+        }
+
+        let timerFiles = files.filter { $0.hasPrefix("com.user.timer-") && $0.hasSuffix(".plist") }
+
+        if timerFiles.isEmpty {
+            Logger.info("No timers found")
+            return
+        }
+
+        Logger.info("Active timers:")
+        for file in timerFiles.sorted() {
+            let plistPath = URL(fileURLWithPath: launchAgentsDir).appendingPathComponent(file).path
+            if let plist = NSDictionary(contentsOfFile: plistPath),
+               let label = plist["Label"] as? String {
+                // 检查任务是否已加载
+                let isLoaded = isTaskLoaded(plistPath)
+                let status = isLoaded ? "✅" : "❌"
+                Logger.info("  \(status) \(label)")
+            }
+        }
+    }
+
+    /// 取消定时任务
+    func cancel(_ identifier: String) {
+        let plistPath: String
+        if identifier.hasPrefix("com.user.") {
+            plistPath = URL(fileURLWithPath: launchAgentsDir).appendingPathComponent(identifier + ".plist").path
+        } else {
+            // 尝试匹配
+            plistPath = URL(fileURLWithPath: launchAgentsDir).appendingPathComponent("com.user.timer-\(identifier).plist").path
+        }
+
+        guard FileManager.default.fileExists(atPath: plistPath) else {
+            Logger.error("Timer not found: \(identifier)")
+            return
+        }
+
+        // 卸载任务
+        unloadTask(plistPath)
+
+        // 删除文件
+        do {
+            try FileManager.default.removeItem(atPath: plistPath)
+            Logger.info("✅ Cancelled timer: \(identifier)")
+        } catch {
+            Logger.error("Failed to remove plist: \(error)")
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    // MARK: - Logging
+    private func setupLogging() {
+        try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true, attributes: nil)
+    }
+
+    private func log(_ message: String, for taskName: String) {
+        let timestamp: String
+        if #available(macOS 13.0, *) {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            timestamp = formatter.string(from: Date())
+        } else {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            timestamp = formatter.string(from: Date())
+        }
+
+        let logFile = "\(logDir)/\(taskName).log"
+
+        if let handle = FileHandle(forWritingAtPath: logFile) {
+            handle.seekToEndOfFile()
+            let logEntry = "[\(timestamp)] \(message)\n"
+            if let data = logEntry.data(using: .utf8) {
+                handle.write(data)
+            }
+            handle.closeFile()
+        } else {
+            // 创建新文件
+            try? "[\(timestamp)] \(message)\n".write(toFile: logFile, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// 查看日志
+    func logs(_ identifier: String? = nil) {
+        setupLogging()
+
+        if let ident = identifier {
+            // 查看特定任务的日志
+            let logFile = "\(logDir)/\(ident).log"
+            guard FileManager.default.fileExists(atPath: logFile) else {
+                Logger.error("No logs found for: \(ident)")
+                return
+            }
+            if let content = try? String(contentsOfFile: logFile) {
+                print(content)
+            }
+        } else {
+            // 列出所有日志文件
+            guard let files = try? FileManager.default.contentsOfDirectory(atPath: logDir) else {
+                Logger.info("No logs found")
+                return
+            }
+            let logFiles = files.filter { $0.hasSuffix(".log") }.sorted()
+            if logFiles.isEmpty {
+                Logger.info("No logs found")
+            } else {
+                Logger.info("Available log files:")
+                for file in logFiles {
+                    let path = "\(logDir)/\(file)"
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                       let size = attrs[.size] as? UInt64 {
+                        let sizeKB = size / 1024
+                        Logger.info("  \(file) (\(sizeKB) KB)")
+                    }
+                }
+                Logger.info("\nUse 'ikit timer logs <identifier>' to view specific logs")
+            }
+        }
+    }
+
+    // MARK: - Validation
+    private func validateFiles(_ files: [String]) -> [String] {
+        var missing: [String] = []
+        for file in files {
+            let expandedPath = (file as NSString).expandingTildeInPath
+            if !FileManager.default.fileExists(atPath: expandedPath) {
+                missing.append(file)
+            }
+        }
+        return missing
+    }
+
+    private func validateDate(_ date: Date) -> Bool {
+        let now = Calendar.current.startOfDay(for: Date())
+        let target = Calendar.current.startOfDay(for: date)
+        return target >= now
+    }
+
+    private func escapeForAppleScript(_ string: String) -> String {
+        return string
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+    }
+
+    // MARK: - Parsing
+    private func parseTime(_ time: String) -> (Int, Int)? {
+        let parts = time.split(separator: ":").map { String($0) }
+        guard parts.count == 2 else { return nil }
+
+        guard let hour = Int(parts[0]), hour >= 0, hour <= 23 else { return nil }
+        guard let minute = Int(parts[1]), minute >= 0, minute <= 59 else { return nil }
+
+        return (hour, minute)
+    }
+
+    private func parseDate(_ date: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.date(from: date)
+    }
+
+    private func generateAppleScript(
+        taskName: String,
+        title: String,
+        message: String,
+        openFiles: [String],
+        openWith: String?,
+        runCommand: String?,
+        thenRunCommand: String?,
+        terminal: String
+    ) -> String {
+        // 转义标题和消息中的特殊字符
+        let safeTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+        let safeMessage = message.replacingOccurrences(of: "\"", with: "\\\"")
+
+        // 优先级1: 如果有 runCommand，直接执行（不需要对话框确认）
+        if let command = runCommand {
+            let escapedCmd = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            return "do shell script \"\(escapedCmd)\"\n"
+        }
+
+        // 优先级2: 如果有 thenRunCommand，显示对话框后执行
+        if let command = thenRunCommand {
+            let timestamp = Int(Date().timeIntervalSince1970)
+            let cmdFile = "/tmp/ikit-timer-\(timestamp).cmd"
+
+            // 创建触发脚本
+            let scriptContent = """
+            #!/bin/bash
+            CMD_FILE="\(cmdFile)"
+            if [[ -f "$CMD_FILE" ]]; then
+                CMD=$(cat "$CMD_FILE")
+                rm -f "$CMD_FILE"
+                # 在 subshell 中 cd 并执行命令
+                (cd ~/Notebooks && eval "$CMD")
+            fi
+            """
+            let scriptFile = "/tmp/ikit-timer-\(timestamp).sh"
+
+            // 写入命令和脚本
+            let writeCmd = "echo '\(command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "'\\''"))' > \(cmdFile) && echo '\(scriptContent.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "'\\''"))' > \(scriptFile) && chmod +x \(scriptFile)"
+
+            // 激活 Ghostty 的 AppleScript
+            let activateScript = """
+            tell application "System Events"
+              set isRunning to exists (processes where name is "\(terminal)")
+            end tell
+
+            tell application "\(terminal)"
+              if not isRunning then
+                activate
+              else
+                tell application "Finder" to activate
+                activate
+              end if
+            end tell
+
+            delay 0.3
+
+            tell application "System Events"
+              tell process "\(terminal)"
+                keystroke "t" using {command down}
+              end tell
+            end tell
+
+            delay 0.4
+
+            tell application "System Events"
+              tell process "\(terminal)"
+                keystroke "\(scriptFile)" & return
+              end tell
+            end tell
+            """
+
+            // 完整的 AppleScript：显示对话框，点击确定后执行
+            let fullScript = """
+            do shell script "\(writeCmd)"
+
+            set userResponse to display dialog "\(safeMessage)" buttons {"取消", "确定"} default button "确定" with title "\(safeTitle)" with icon note
+
+            if button returned of userResponse is "确定" then
+                \(activateScript)
+            end if
+            """
+
+            return fullScript
+        }
+
+        // 优先级3: 如果有文件要打开，显示对话框后打开
+        if !openFiles.isEmpty {
+            var openCommands: [String] = []
+            for file in openFiles where !file.isEmpty {
+                let expandedPath = (file as NSString).expandingTildeInPath
+                if let app = openWith {
+                    openCommands.append("tell application \"\(app)\" to open POSIX file \"\(expandedPath)\"")
+                } else {
+                    openCommands.append("tell application \"Finder\" to open POSIX file \"\(expandedPath)\"")
+                }
+            }
+            if !openCommands.isEmpty {
+                let openScript = openCommands.joined(separator: "\n")
+                return """
+                set userResponse to display dialog "\(safeMessage)" buttons {"取消", "确定"} default button "确定" with title "\(safeTitle)" with icon note
+                if button returned of userResponse is "确定" then
+                    \(openScript)
+                end if
+                """
+            }
+        }
+
+        // 优先级4: 只显示对话框，不执行任何操作
+        return "display dialog \"\(safeMessage)\" buttons {\"确定\"} default button \"确定\" with title \"\(safeTitle)\" with icon note\n"
+    }
+
+    private func generatePlist(
+        taskName: String,
+        hour: Int,
+        minute: Int,
+        day: Int?,
+        month: Int?,
+        year: Int?,
+        weekday: Int?,
+        isDaily: Bool,
+        script: String
+    ) -> String {
+        var interval = ""
+
+        if isDaily {
+            // 每天：只设置 Hour 和 Minute
+            interval = """
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>\(hour)</integer>
+        <key>Minute</key><integer>\(minute)</integer>
+    </dict>
+"""
+        } else if let d = day, let m = month, let y = year {
+            // 指定日期
+            interval = """
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key><integer>\(d)</integer>
+        <key>Month</key><integer>\(m)</integer>
+        <key>Year</key><integer>\(y)</integer>
+        <key>Hour</key><integer>\(hour)</integer>
+        <key>Minute</key><integer>\(minute)</integer>
+    </dict>
+"""
+        } else if let wd = weekday {
+            // 每周某天
+            interval = """
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>\(hour)</integer>
+        <key>Minute</key><integer>\(minute)</integer>
+        <key>Weekday</key><integer>\(wd)</integer>
+    </dict>
+"""
+        } else {
+            // 默认（今天一次性）
+            interval = """
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>\(hour)</integer>
+        <key>Minute</key><integer>\(minute)</integer>
+    </dict>
+"""
+        }
+
+        return """
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.\(taskName)</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>~/.local/bin/ikit</string>
+        <string>timer</string>
+        <string>execute</string>
+        <string>\(taskName)</string>
+    </array>
+\(interval)
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>~/Library/Logs/com.user.ikit.timer/\(taskName).stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/Library/Logs/com.user.ikit.timer/\(taskName).stderr.log</string>
+
+</dict>
+</plist>
+"""
+    }
+
+    private func loadTask(_ plistPath: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["load", plistPath]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                Logger.info("✅ Timer loaded and scheduled")
+            } else {
+                Logger.warn("Failed to load timer (may already be loaded)")
+            }
+        } catch {
+            Logger.error("Failed to run launchctl: \(error)")
+        }
+    }
+
+    private func unloadTask(_ plistPath: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["unload", plistPath]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            // 忽略卸载失败（可能任务未加载）
+        }
+    }
+
+    private func isTaskLoaded(_ plistPath: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["list"]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8) {
+                // 提取 label
+                let label = URL(fileURLWithPath: plistPath).deletingPathExtension().lastPathComponent
+                return output.contains(label)
+            }
+        } catch {}
+
+        return false
+    }
+
+    // MARK: - Task Config Management
+
+    private func saveTaskConfig(taskName: String, config: [String: Any]) {
+        let configURL = URL(fileURLWithPath: logDir).appendingPathComponent("\(taskName).json")
+        guard let data = try? JSONSerialization.data(withJSONObject: config, options: .prettyPrinted) else {
+            Logger.error("Failed to serialize config")
+            return
+        }
+        try? data.write(to: configURL)
+        log("Config saved: \(configURL.path)", for: taskName)
+    }
+
+    private func loadTaskConfig(taskName: String) -> [String: Any]? {
+        let configPath = URL(fileURLWithPath: logDir).appendingPathComponent("\(taskName).json").path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+              let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return config
+    }
+
+    // MARK: - Execute
+
+    func execute(_ taskName: String) {
+        // 重定向 stderr 到文件
+        setupLogging()
+
+        log("=== EXECUTE STARTED ===", for: taskName)
+        log("Task: \(taskName)", for: taskName)
+        log("Time: \(ISO8601DateFormatter().string(from: Date()))", for: taskName)
+
+        guard let config = loadTaskConfig(taskName: taskName) else {
+            log("❌ ERROR: Config not found for task: \(taskName)", for: taskName)
+            Logger.error("Task config not found: \(taskName)")
+            exit(1)
+        }
+
+        let title = config["title"] as? String ?? "Timer"
+        let message = config["message"] as? String ?? "⏰ Timer"
+        let openFiles = config["openFiles"] as? [String] ?? []
+        let openWith = config["openWith"] as? String ?? ""
+        let runCommand = config["runCommand"] as? String ?? ""
+        let thenRunCommand = config["thenRunCommand"] as? String ?? ""
+
+        // 执行操作
+        let success = executeAction(
+            title: title,
+            message: message,
+            openFiles: openFiles,
+            openWith: openWith,
+            runCommand: runCommand,
+            thenRunCommand: thenRunCommand
+        )
+
+        if success {
+            log("✅ EXECUTE SUCCEEDED", for: taskName)
+            exit(0)
+        } else {
+            log("❌ EXECUTE FAILED", for: taskName)
+            exit(1)
+        }
+    }
+
+    private func executeAction(
+        title: String,
+        message: String,
+        openFiles: [String],
+        openWith: String,
+        runCommand: String,
+        thenRunCommand: String
+    ) -> Bool {
+        // 优先级1: runCommand + thenRunCommand (显示对话框)
+        if !runCommand.isEmpty {
+            // 显示对话框
+            let dialogResult = Shell.run("/usr/bin/osascript", args: ["-e", """
+                display dialog "\(message)" buttons {"取消", "确定"} default button "确定" with title "\(title)" with icon note
+            """])
+            if dialogResult.exitCode == 0, let output = dialogResult.output, output.contains("确定") {
+                // 用户点击确定，执行命令
+                let result = Shell.run("/bin/sh", args: ["-c", runCommand])
+                if result.exitCode == 0, !thenRunCommand.isEmpty {
+                    let thenResult = Shell.run("/bin/sh", args: ["-c", thenRunCommand])
+                    return thenResult.exitCode == 0
+                }
+                return result.exitCode == 0
+            }
+            return false
+        }
+
+        // 优先级2: thenRunCommand only (显示对话框)
+        if !thenRunCommand.isEmpty {
+            let dialogResult = Shell.run("/usr/bin/osascript", args: ["-e", """
+                display dialog "\(message)" buttons {"取消", "确定"} default button "确定" with title "\(title)" with icon note
+            """])
+            if dialogResult.exitCode == 0, let output = dialogResult.output, output.contains("确定") {
+                let result = Shell.run("/bin/sh", args: ["-c", thenRunCommand])
+                return result.exitCode == 0
+            }
+            return false
+        }
+
+        // 优先级3: openFiles (显示对话框后打开)
+        if !openFiles.isEmpty {
+            // 构建文件列表描述
+            let fileList = openFiles.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath).lastPathComponent }.joined(separator: ", ")
+
+            // 显示对话框
+            let dialogResult = Shell.run("/usr/bin/osascript", args: ["-e", """
+                display dialog "\(message)\n\n文件: \(fileList)" buttons {"取消", "确定"} default button "确定" with title "\(title)" with icon note
+            """])
+
+            if dialogResult.exitCode != 0 || (dialogResult.output?.contains("确定") == false) {
+                return false
+            }
+
+            // 打开文件
+            for file in openFiles where !file.isEmpty {
+                let expandedPath = (file as NSString).expandingTildeInPath
+                if !openWith.isEmpty {
+                    _ = Shell.run("/usr/bin/open", args: ["-a", openWith, expandedPath])
+                } else {
+                    _ = Shell.run("/usr/bin/open", args: [expandedPath])
+                }
+            }
+            return true
+        }
+
+        // 优先级4: 只显示对话框
+        let script = "display dialog \"\(message)\" buttons {\"确定\"} default button \"确定\" with title \"\(title)\" with icon note"
+        let result = Shell.run("/usr/bin/osascript", args: ["-e", script])
+        return result.exitCode == 0
+    }
+}
+
 // MARK: - Secretary Tool
 class SecretaryTool {
     let logger = Logger.self
     let configManager = ConfigManager.shared
-    
-    private func summarize(text: String, visualContext: String = "") async -> String {
-        guard let urlStr = configManager.current.ollama_url,
-              let url = URL(string: urlStr),
-              let model = configManager.current.ollama_model else {
-            return "⚠️ Config missing for Ollama"
+
+    private func loadImageAsBase64(path: String) -> String? {
+        guard let imageData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            return nil
         }
-        
-        var request = URLRequest(url: url, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 300)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        let prompt = "你是一个专业的会议秘书。结合转录和截图生成一份精准的结构化纪要，尽可能使用真实姓名：\n\(text.prefix(12000))\n视觉上下文：\n\(visualContext)"
-        
-        let body: [String: Any] = [
-            "model": model,
-            "prompt": prompt,
-            "stream": false
-        ]
-        
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        
-        do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let res = json["response"] as? String {
-                return res
+        let base64Str = imageData.base64EncodedString()
+        return "data:image/jpeg;base64,\(base64Str)"
+    }
+
+    private func summarize(text: String, screenshots: [String] = []) async -> String {
+        let prompt = "你是一个专业的会议秘书。结合转录和截图生成一份精准的结构化纪要，尽可能使用真实姓名：\n\(text.prefix(12000))"
+
+        // Try vision model first if screenshots are available
+        if !screenshots.isEmpty,
+           let urlStr = configManager.current.litellm_url,
+           let visionModel = configManager.current.litellm_vision_model,
+           let baseUrl = URL(string: urlStr.replacingOccurrences(of: "/v1/completions", with: "/v1/chat/completions")) {
+            var request = URLRequest(url: baseUrl, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 300)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+            if let apiKey = configManager.current.litellm_api_key, !apiKey.isEmpty {
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
             }
-        } catch {
-            Logger.debug("Ollama Error: \(error)")
+
+            // Build content with images (limit to first 5 screenshots)
+            var content: [[String: Any]] = [["type": "text", "text": prompt]]
+            for shot in screenshots.prefix(5) {
+                if let base64 = loadImageAsBase64(path: shot) {
+                    content.append([
+                        "type": "image_url",
+                        "image_url": ["url": base64]
+                    ])
+                }
+            }
+
+            let body: [String: Any] = [
+                "model": visionModel,
+                "messages": [["role": "user", "content": content]],
+                "stream": false,
+                "max_tokens": 100000
+            ]
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+            do {
+                let (data, _) = try await URLSession.shared.data(for: request)
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let msg = choices.first?["message"] as? [String: Any],
+                   let text = msg["content"] as? String {
+                    return text
+                }
+            } catch {
+                Logger.debug("Vision model error: \(error)")
+            }
         }
+
+        // Fallback to text-only LiteLLM
+        if let urlStr = configManager.current.litellm_url,
+           let url = URL(string: urlStr),
+           let model = configManager.current.litellm_model {
+            var request = URLRequest(url: url, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 300)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+            if let apiKey = configManager.current.litellm_api_key, !apiKey.isEmpty {
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            }
+
+            let visualContext = screenshots.isEmpty ? "" : "Screenshots captured: \(screenshots.count) files"
+            let fullPrompt = "\(prompt)\n视觉上下文：\n\(visualContext)"
+
+            let body: [String: Any] = [
+                "model": model,
+                "prompt": fullPrompt,
+                "stream": false,
+                "max_tokens": 100000
+            ]
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+            do {
+                let (data, _) = try await URLSession.shared.data(for: request)
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let text = choices.first?["text"] as? String {
+                    return text
+                }
+            } catch {
+                Logger.debug("LiteLLM Error: \(error)")
+            }
+        }
+
+        // Fallback to Ollama
+        if let urlStr = configManager.current.ollama_url,
+           let url = URL(string: urlStr),
+           let model = configManager.current.ollama_model {
+            var request = URLRequest(url: url, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 300)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+            let visualContext = screenshots.isEmpty ? "" : "Screenshots captured: \(screenshots.count) files"
+            let fullPrompt = "\(prompt)\n视觉上下文：\n\(visualContext)"
+
+            let body: [String: Any] = [
+                "model": model,
+                "prompt": fullPrompt,
+                "stream": false,
+                "max_tokens": 100000
+            ]
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+            do {
+                let (data, _) = try await URLSession.shared.data(for: request)
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let res = json["response"] as? String {
+                    return res
+                }
+            } catch {
+                Logger.debug("Ollama Error: \(error)")
+            }
+        }
+
         return "⚠️ Summarization failed."
     }
-    
+
     private func performOCR(on imagePath: String) async -> String {
         let url = URL(fileURLWithPath: imagePath)
         guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else { return "" }
-        
+
         return await withCheckedContinuation { continuation in
             let request = VNRecognizeTextRequest { req, _ in
                 let strings = (req.results as? [VNRecognizedTextObservation])?.compactMap { $0.topCandidates(1).first?.string }
@@ -2053,7 +3121,7 @@ class SecretaryTool {
         for file in files {
             guard fm.fileExists(atPath: file) else { continue }
             Logger.info("🤖 Processing: \(file)")
-            
+
             var content = ""
             if file.hasSuffix(".json"),
                let data = try? Data(contentsOf: URL(fileURLWithPath: file)),
@@ -2062,26 +3130,27 @@ class SecretaryTool {
             } else {
                 content = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
             }
-            
+
             if content.isEmpty { continue }
-            
+
             let fileDir = (file as NSString).deletingLastPathComponent
             let screenshots = (try? fm.contentsOfDirectory(atPath: fileDir))?
                 .filter { $0.hasPrefix("shot_") && $0.hasSuffix(".jpg") }
                 .sorted() ?? []
-            
+
             var visualContext = ""
-            // OCR first 10 screenshots to provide context
-            for shot in screenshots.prefix(10) {
-                let text = await performOCR(on: "\(fileDir)/\(shot)")
-                visualContext += "Screenshot \(shot): \(text)\n"
-            }
-            
-            let summary = await summarize(text: content, visualContext: visualContext)
-            
+            // OCR disabled to prevent CPU spikes (daemon should only orchestrate, not process)
+            // OCR is CPU-intensive and causes iKit daemon to spike to 200-500%
+            // If needed, this should be moved to Python async processing
+
+            // Build full screenshot paths for vision model
+            let screenshotPaths = screenshots.map { "\(fileDir)/\($0)" }
+
+            let summary = await summarize(text: content, screenshots: screenshotPaths)
+
             let dateStr = ISO8601DateFormatter().string(from: Date())
             let outPath = (outputDir as NSString).appendingPathComponent("\(dateStr)-\((file as NSString).lastPathComponent).md")
-            
+
             try? summary.write(toFile: outPath, atomically: true, encoding: String.Encoding.utf8)
             Logger.info("✅ Saved to: \(outPath)")
         }
@@ -2093,10 +3162,10 @@ class SecretaryTool {
             Logger.error("Python/Script path not configured")
             return
         }
-        
+
         let out = URL(fileURLWithPath: audioPath).deletingPathExtension().appendingPathExtension("json").path
         Logger.info("🎤 Transcribing (FunASR): \(audioPath)")
-        
+
         _ = Shell.run(python, args: [script, audioPath, "--output", out])
     }
 }
@@ -2107,31 +3176,31 @@ struct App {
 
     static func main() async {
         let args = CommandLine.arguments; let configManager = ConfigManager.shared
-        
+
         let json = args.contains("--json")
         let dryRun = args.contains("--dry-run")
         let isId = args.contains("--id")
         let isHelp = args.contains("--help") || args.contains("-h")
-        
+
         // Photo flags
         let isScreenshots = args.contains("--screenshots")
         let isFavorites = args.contains("--favorites")
-        
+
         // Init Logger
         if args.contains("-v") || args.contains("--verbose") { Logger.verbose = true }
-        
+
         if args.contains("--version") { Logger.info("iKit version \(VERSION)"); return }
-        
+
         if isHelp { printHelp(for: args.count > 1 ? args[1] : nil); return }
         guard args.count > 1 else { printHelp(for: nil); return }
-        
+
         let cmd = args[1]; let sub = args.count > 2 ? args[2] : ""
-        
+
         func getRoot() -> String? {
             if args.count > 3 && !args[3].starts(with: "-") { return args[3] }
             return configManager.current.notes_root?.replacingOccurrences(of: "~", with: FileManager.default.homeDirectoryForCurrentUser.path)
         }
-        
+
         func getIntParam(_ name: String) -> Int? {
             // First try: --param value (separate)
             if let idx = args.firstIndex(of: name), idx + 1 < args.count { return Int(args[idx + 1]) }
@@ -2157,8 +3226,30 @@ struct App {
             }
             return nil
         }
+
+        func getMultipleStringParams(_ name: String) -> [String] {
+            var result: [String] = []
+            var i = 0
+            while i < args.count {
+                if args[i] == name && i + 1 < args.count && !args[i + 1].starts(with: "--") {
+                    result.append(args[i + 1])
+                    i += 2
+                } else if args[i].hasPrefix("\(name)=") {
+                    let value = String(args[i].dropFirst(name.count + 1))
+                    result.append(value)
+                    i += 1
+                } else {
+                    i += 1
+                }
+            }
+            return result
+        }
+
+        func getBoolParam(_ name: String) -> Bool {
+            return args.contains(name)
+        }
         let count = getIntParam("--last") ?? 10
-        
+
         switch cmd {
         case "config":
             if sub == "init" { configManager.save() }
@@ -2167,7 +3258,7 @@ struct App {
                 if let data = try? encoder.encode(configManager.current), let str = String(data: data, encoding: .utf8) { print(str) }
             }
             else { print("Usage: ikit config [init|show]") }
-            
+
         case "task":
             let t = RemindersTool()
             if sub == "list" { await t.listTasks(json: json) }
@@ -2181,18 +3272,18 @@ struct App {
             else if sub == "complete" && args.count > 3 { await t.completeTask(query: args[3], isId: isId) }
             else if sub == "delete" && args.count > 3 { await t.deleteTask(query: args[3], isId: isId, dryRun: dryRun) }
             else { printHelp(for: "task") }
-            
+
         case "cal":
             let t = CalendarTool()
             if sub == "list" { await t.listEvents(json: json) }
             else if sub == "new" && args.count > 4 { await t.newEvent(title: args[3], time: args[4]) }
             else if sub == "delete" && args.count > 3 { await t.deleteEvent(title: args[3]) }
             else { printHelp(for: "cal") }
-            
+
         case "contact":
             if sub == "search" && args.count > 3 { await ContactsTool().search(query: args[3], json: json) }
             else { printHelp(for: "contact") }
-            
+
         case "photo":
             let t = PhotoTool()
             if sub == "list" { await t.listRecent(count: count, screenshots: isScreenshots, favorites: isFavorites, json: json) }
@@ -2200,13 +3291,13 @@ struct App {
                 if args.count > 3 && !args[3].starts(with: "-") { await t.ocr(assetId: args[3]) }
                 else { await t.batchOcr(count: count, screenshots: isScreenshots, favorites: isFavorites) }
             } else { printHelp(for: "photo") }
-            
+
         case "sc":
             let t = ShortcutsTool()
             if sub == "list" { t.listShortcuts() }
             else if sub == "run" && args.count > 3 { t.runShortcut(name: args[3], input: args.count > 4 ? args[4] : nil) }
             else { printHelp(for: "sc") }
-            
+
         case "note":
             let t = NotesTool()
             guard let root = getRoot() else { Logger.error("Missing root"); return }
@@ -2216,7 +3307,7 @@ struct App {
             else if sub == "update" && args.count > 6 { t.update(targetDir: root, folder: args[4], title: args[5], content: args[6]) }
             else if sub == "delete" && args.count > 5 { t.delete(targetDir: root, folder: args[4], title: args[5]) }
             else { printHelp(for: "note") }
-            
+
         case "meet":
             let t = SecretaryTool()
             if sub == "start" && args.count > 2 {
@@ -2271,15 +3362,66 @@ struct App {
                         mode = .both
                     }
 
-                    // Find output directory (first non-flag argument after "daemon")
-                    let outputDir: String
-                    if let dirIndex = args.firstIndex(where: { !$0.starts(with: "--") && args.firstIndex(of: $0) ?? 0 > 2 }) {
-                        outputDir = args[dirIndex]
+                    // Get segment interval (default 15 minutes)
+                    var segmentMinutes = 15
+                    var intervalIndex: Int?
+
+                    // Format 1: --interval N (space separated)
+                    if let idx = args.firstIndex(of: "--interval") {
+                        intervalIndex = idx
+                        if idx + 1 < args.count {
+                            let intervalStr = args[idx + 1]
+                            // Parse interval (supports formats like "5m", "10", "3m")
+                            if intervalStr.hasSuffix("m") || intervalStr.hasSuffix("M") {
+                                segmentMinutes = Int(intervalStr.dropLast()) ?? 15
+                            } else {
+                                segmentMinutes = Int(intervalStr) ?? 15
+                            }
+                        }
                     } else {
-                        outputDir = args[3]  // Default to position 3
+                        // Format 2: --interval=N (equals sign)
+                        for arg in args {
+                            if arg.hasPrefix("--interval=") {
+                                let value = arg.dropFirst(11)  // Remove "--interval="
+                                if value.hasSuffix("m") || value.hasSuffix("M") {
+                                    segmentMinutes = Int(value.dropLast()) ?? 15
+                                } else {
+                                    segmentMinutes = Int(value) ?? 15
+                                }
+                                break
+                            }
+                        }
                     }
 
-                    await Daemon(mode: mode).run(outputDir: outputDir)
+                    // Find output directory (first non-flag argument after "daemon")
+                    // Skip: program path, commands, flags (--mic-only, --system-only, --interval), their values, and -v, -h, etc.
+                    var outputDir = "~/recordings"
+
+                    // Build a set of indices to skip (flags and their values)
+                    var skipIndices = Set<Int>()
+                    var flagsToSkip = ["--mic-only", "--system-only", "--interval"]
+
+                    // Skip flags and their values
+                    for flag in flagsToSkip {
+                        if let idx = args.firstIndex(of: flag) {
+                            skipIndices.insert(idx)
+                            if idx + 1 < args.count && !args[idx + 1].starts(with: "-") {
+                                skipIndices.insert(idx + 1)
+                            }
+                        }
+                    }
+
+                    // Find first non-skipped argument after "daemon" command
+                    if let daemonIdx = args.firstIndex(of: "daemon") {
+                        for i in (daemonIdx + 1)..<args.count {
+                            if !skipIndices.contains(i) && !args[i].starts(with: "-") {
+                                outputDir = args[i]
+                                break
+                            }
+                        }
+                    }
+
+                    await Daemon(mode: mode, segmentMinutes: segmentMinutes).run(outputDir: outputDir)
                 }
             } else if sub == "process" && args.count > 3 {
                 // files...
@@ -2288,7 +3430,41 @@ struct App {
                 let files = Array(args[3..<args.count-1])
                 await t.process(files: files, outputDir: outDir)
             } else { print("Usage: ikit meet [start|process|transcribe|daemon]") }
-            
+
+        case "timer":
+            let t = TimerTool()
+            if sub == "list" { t.list() }
+            else if sub == "cancel" && args.count > 3 { t.cancel(args[3]) }
+            else if sub == "logs" {
+                if args.count > 3 { t.logs(args[3]) }
+                else { t.logs() }
+            }
+            else if sub == "execute" && args.count > 3 {
+                t.execute(args[3])
+            }
+            else if sub == "new" || sub.isEmpty {
+                // 需要至少 --time 参数
+                guard let time = getStringParam("--time") else {
+                    Logger.error("Missing --time parameter (HH:MM format)")
+                    print("Usage: ikit timer new --time HH:MM [--daily] [--date YYYY-MM-DD] [--weekday N] [--open FILE]... [--with APP] [--run COMMAND] [--then-run COMMAND] [--terminal APP] [--title TITLE] [--message MESSAGE]")
+                    return
+                }
+                let openFiles = getMultipleStringParams("--open")
+                t.create(
+                    time: time,
+                    date: getStringParam("--date"),
+                    weekday: getIntParam("--weekday"),
+                    daily: getBoolParam("--daily"),
+                    open: openFiles,
+                    with: getStringParam("--with"),
+                    run: getStringParam("--run"),
+                    thenRun: getStringParam("--then-run"),
+                    terminal: getStringParam("--terminal") ?? "Ghostty",
+                    title: getStringParam("--title") ?? "Timer",
+                    message: getStringParam("--message")
+                )
+            } else { printHelp(for: "timer") }
+
         default: printHelp(for: nil)
         }
     }
@@ -2302,9 +3478,24 @@ struct App {
         case "photo": helpText = "Photo: list [--json] [--screenshots] [--favorites] [--last N], ocr [<assetId>] [--screenshots --last N]"
         case "contact": helpText = "Contact: search <name> [--json]"
         case "sc": helpText = "Shortcuts: list, run <name> [input]"
-        case "meet": helpText = "Meet: daemon [--mic-only|--system-only] <outDir>, transcribe <audio>, process <json/txt...> <outDir>"
+        case "meet": helpText = "Meet: daemon [--mic-only|--system-only] [--interval=N] <outDir>, transcribe <audio>, process <json/txt...> <outDir>"
+        case "timer": helpText = """
+Timer: Schedule notifications and automation
+  new      --time HH:MM [--daily] [--date YYYY-MM-DD] [--weekday N]
+            [--open FILE]... [--with APP] [--run CMD] [--then-run CMD]
+            [--terminal APP] [--title TITLE] [--message MSG]
+  list                     List all timers
+  cancel   <identifier>     Cancel a timer
+  logs     [<identifier>]   Show execution logs
+
+Examples:
+  ikit timer new --time 09:00 --daily --title "Daily Standup"
+  ikit timer new --time 10:00 --weekday 1 --open agenda.md --open notes.txt
+  ikit timer list
+  ikit timer cancel timer-daily-0900
+"""
         case "config": helpText = "Config: init, show"
-        default: helpText = "iKit v\(VERSION) | Usage: ikit [task|cal|note|photo|contact|sc|meet|config] [command] [args] [--json] [--id] [--dry-run] [--help] [-v]"
+        default: helpText = "iKit v\(VERSION) | Usage: ikit [task|cal|note|photo|contact|sc|meet|timer|config] [command] [args] [--json] [--id] [--dry-run] [--help] [-v]"
         }
         print(helpText)
     }
