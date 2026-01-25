@@ -744,6 +744,47 @@ def get_funasr_model(device="mps", language="zh"):
 
     return model
 
+def simplify_output(result: dict) -> dict:
+    """
+    Simplify transcription output by removing word-level timestamps.
+
+    Args:
+        result: Original result with word-level timestamps
+
+    Returns:
+        Simplified result with only sentence-level info
+    """
+    simplified = {}
+
+    # Keep metadata fields
+    if 'key' in result:
+        simplified['key'] = result['key']
+    if 'text' in result:
+        simplified['text'] = result['text']
+
+    # Transform sentence_info -> sentences, remove word-level timestamps
+    if 'sentence_info' in result:
+        simplified['sentences'] = []
+        for sent in result['sentence_info']:
+            simple_sent = {
+                'text': sent.get('text', ''),
+                'start': sent.get('start', 0),
+                'end': sent.get('end', 0),
+            }
+            # Keep speaker info if present
+            if 'spk' in sent:
+                simple_sent['spk'] = sent['spk']
+            if 'speaker' in sent:
+                simple_sent['speaker'] = sent['speaker']
+            if 'track' in sent:
+                simple_sent['track'] = sent['track']
+            if 'speaker_name' in sent:
+                simple_sent['speaker_name'] = sent['speaker_name']
+
+            simplified['sentences'].append(simple_sent)
+
+    return simplified
+
 def main():
     parser = argparse.ArgumentParser(description="iKit ASR Transcriber - FunASR + WhisperX + MLX")
     parser.add_argument("input_files", nargs='+', help="Path(s) to audio file(s)")
@@ -756,6 +797,10 @@ def main():
     parser.add_argument("--no-gating", action="store_true", help="Disable aggressive gating (FunASR only)")
     parser.add_argument("--mlx-model", default="mlx-community/whisper-large-v3-mlx",
                         help="MLX-Whisper model path (default: mlx-community/whisper-large-v3-mlx)")
+    parser.add_argument("--simple", action="store_true", default=True,
+                        help="Simplified output (no word-level timestamps). Default: True")
+    parser.add_argument("--full", action="store_true",
+                        help="Full output with word-level timestamps. Overrides --simple")
     args = parser.parse_args()
 
     # Check dependencies
@@ -777,6 +822,13 @@ def main():
     logger.info(f"⚡️ Inference Device: {device.upper()}")
     logger.info(f"🔧 ASR Engine: {args.engine.upper()}")
     logger.info(f"🌐 Language: {args.language}")
+
+    # Output mode
+    use_simple = args.simple and not args.full
+    if use_simple:
+        logger.info("📝 Output mode: Simple (sentence-level only)")
+    else:
+        logger.info("📝 Output mode: Full (with word-level timestamps)")
 
     # 2. Determine input mode
     input_files = args.input_files
@@ -845,17 +897,20 @@ def main():
         sys.exit(1)
 
     # 3. Output Handling
+    # Apply simplification if in simple mode (default)
+    output_result = simplify_output(result) if use_simple else result
+
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
+                json.dump(output_result, f, ensure_ascii=False, indent=2)
             logger.info(f"💾 Result saved to: {args.output}")
         except Exception as e:
             logger.error(f"Failed to write output: {e}")
             sys.exit(1)
     else:
         # If no output file, print JSON to stdout
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps(output_result, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
     main()
