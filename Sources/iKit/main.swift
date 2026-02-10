@@ -1777,8 +1777,10 @@ class Daemon {
   }
 
   private func checkFunASRAvailability() -> Bool {
+    let pythonPath = ConfigManager.shared.current.python_path ?? "/usr/local/bin/python3"
+
     let process = Process()
-    process.launchPath = "/usr/local/bin/python3"
+    process.launchPath = pythonPath
     process.arguments = ["-c", "import funasr; print('OK')"]
 
     let pipe = Pipe()
@@ -2621,6 +2623,24 @@ class NotesBridge: NSObject {
       """
     return executeAppleScript(script) ?? "Error: Script failed"
   }
+
+  func moveNote(name: String, fromFolderId: String, toFolderId: String) -> String {
+    let escName = escape(name)
+    let script = """
+      tell application \"Notes\"
+          try
+              set sourceFolder to folder id \"\(fromFolderId)\"
+              set targetFolder to folder id \"\(toFolderId)\"
+              set theNote to first note in sourceFolder whose name is \"\(escName)\"
+              move theNote to end of notes of targetFolder
+              return \"success\"
+          on error err
+              return \"Error: \" & err
+          end try
+      end tell
+      """
+    return executeAppleScript(script) ?? "Error: Script failed"
+  }
 }
 
 // MARK: - Notes Tool
@@ -2761,6 +2781,38 @@ class NotesTool {
         try? fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: localPath)
         try? fm.removeItem(atPath: localPath)
       }
+    } else {
+      Logger.error("Failed: \(res)")
+    }
+  }
+  func move(targetDir: String, sourceFolder: String, title: String, targetFolder: String) {
+    guard let sourceId = findFolderId(path: sourceFolder) else {
+      Logger.error("Source folder not found: \(sourceFolder)")
+      return
+    }
+    guard let targetId = findFolderId(path: targetFolder) else {
+      Logger.error("Target folder not found: \(targetFolder)")
+      return
+    }
+    let res = bridge.moveNote(name: title, fromFolderId: sourceId, toFolderId: targetId)
+    if res == "success" {
+      Logger.info("✅ Moved note '\(title)' from '\(sourceFolder)' to '\(targetFolder)'")
+      // Remove old file from source folder (local mirror cleanup)
+      // Note: filename includes short ID suffix, so we need to find by prefix
+      let safeName = title.replacingOccurrences(of: "/", with: ":")
+      let sourceDirPath = (targetDir as NSString).appendingPathComponent(sourceFolder)
+      if let enumerator = fm.enumerator(atPath: sourceDirPath) {
+        for case let file as String in enumerator {
+          if file.hasPrefix("\(safeName) [") && file.hasSuffix("].md") {
+            let fullPath = sourceDirPath + "/" + file
+            try? fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fullPath)
+            try? fm.removeItem(atPath: fullPath)
+            Logger.debug("  🗑️ Removed old file: \(file)")
+            break
+          }
+        }
+      }
+      sync(targetDir: targetDir)
     } else {
       Logger.error("Failed: \(res)")
     }
@@ -4504,8 +4556,24 @@ class SecretaryTool {
       let outPath = (outputDir as NSString).appendingPathComponent(
         "\(dateStr)-\((file as NSString).lastPathComponent).md")
 
-      try? summary.write(toFile: outPath, atomically: true, encoding: String.Encoding.utf8)
-      Logger.info("✅ Saved to: \(outPath)")
+      // Create output directory if it doesn't exist
+      let outDirPath = (outPath as NSString).deletingLastPathComponent
+      if !fm.fileExists(atPath: outDirPath) {
+        try? fm.createDirectory(atPath: outDirPath, withIntermediateDirectories: true)
+      }
+
+      // Write file and verify success
+      do {
+        try summary.write(toFile: outPath, atomically: true, encoding: String.Encoding.utf8)
+        if fm.fileExists(atPath: outPath) {
+          Logger.info("✅ Saved to: \(outPath)")
+        } else {
+          Logger.error("❌ File write reported success but file not found: \(outPath)")
+        }
+      } catch {
+        Logger.error("❌ Failed to write file: \(outPath)")
+        Logger.error("Error: \(error)")
+      }
     }
   }
 
@@ -4520,14 +4588,40 @@ class SecretaryTool {
     let out = URL(fileURLWithPath: audioPath).deletingPathExtension().appendingPathExtension("json")
       .path
     Logger.info("🎤 Transcribing (FunASR): \(audioPath)")
+    Logger.info("⏳ Loading models (this may take a moment on first run)...")
 
-    _ = Shell.run(python, args: [script, audioPath, "--output", out])
+    let result = Shell.run(python, args: [script, audioPath, "--output", out])
+
+    // Forward Python script output for visibility
+    if let output = result.output, !output.isEmpty {
+      // Print each line to show progress
+      for line in output.components(separatedBy: "\n") {
+        if !line.isEmpty {
+          print(line)
+        }
+      }
+    }
+
+    // Check if transcription succeeded
+    if result.exitCode == 0 {
+      // Verify output file was created
+      if FileManager.default.fileExists(atPath: out) {
+        Logger.info("✅ Transcription saved to: \(out)")
+      } else {
+        Logger.error("❌ Transcription completed but output file not found: \(out)")
+      }
+    } else {
+      Logger.error("❌ Transcription failed (exit code: \(result.exitCode))")
+      if let error = result.error {
+        Logger.error("Error: \(error)")
+      }
+    }
   }
 }
 
 // MARK: - Main
 struct App {
-  static let VERSION = "2.6.0"
+  static let VERSION = "2.8.1"
 
   static func main() async {
     let args = CommandLine.arguments
@@ -4765,6 +4859,8 @@ struct App {
         t.update(targetDir: root, folder: args[4], title: args[5], content: args[6])
       } else if sub == "delete" && args.count > 5 {
         t.delete(targetDir: root, folder: args[4], title: args[5])
+      } else if sub == "move" && args.count > 6 {
+        t.move(targetDir: root, sourceFolder: args[4], title: args[5], targetFolder: args[6])
       } else {
         printHelp(for: "note")
       }
@@ -5036,7 +5132,7 @@ struct App {
     case "cal": helpText = "Calendar: list [--json], new <title> <YYYY-MM-DD HH:mm>, delete <title>"
     case "note":
       helpText =
-        "Note: sync [path] [--folder=NAME], new [path] <folder> <title> <content>, append/update/delete ..."
+        "Note: sync [path] [--folder=NAME], new/append/update/delete/move [path] <folder> <title> [<content>|<target-folder>]"
     case "photo":
       helpText =
         "Photo: list [--json] [--screenshots] [--favorites] [--last N], ocr [<assetId>] [--screenshots --last N]"
