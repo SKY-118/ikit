@@ -3222,6 +3222,58 @@ class PhotoTool {
   }
 }
 
+// MARK: - OCR from File Path
+/// OCR directly from image file path (independent of Photos library)
+func ocrFromPath(_ imagePath: String) async {
+  let url = URL(fileURLWithPath: imagePath)
+
+  // Check if file exists
+  guard FileManager.default.fileExists(atPath: imagePath) else {
+    Logger.error("❌ File not found: \(imagePath)")
+    return
+  }
+
+  // Load image
+  guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil),
+    let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil)
+  else {
+    Logger.error("❌ Failed to load image: \(imagePath)")
+    return
+  }
+
+  Logger.info("🔍 OCR processing: \(imagePath)")
+
+  // Perform OCR
+  await withCheckedContinuation { continuation in
+    let request = VNRecognizeTextRequest { req, _ in
+      guard let observations = req.results as? [VNRecognizedTextObservation] else {
+        Logger.info("No text found in image")
+        continuation.resume()
+        return
+      }
+
+      let texts = observations.compactMap { $0.topCandidates(1).first?.string }
+      if texts.isEmpty {
+        Logger.info("No text found in image")
+      } else {
+        print(texts.joined(separator: "\n"))
+      }
+      continuation.resume()
+    }
+
+    request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+
+    do {
+      try VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+    } catch {
+      Logger.error("❌ OCR error: \(error)")
+      continuation.resume()
+    }
+  }
+}
+
 // MARK: - Shortcuts Tool
 class ShortcutsTool {
   func listShortcuts() {
@@ -4877,6 +4929,13 @@ struct App {
         printHelp(for: "photo")
       }
 
+    case "ocr":
+      if args.count > 2 {
+        await ocrFromPath(args[2])
+      } else {
+        print("Usage: ikit ocr <image-path>")
+      }
+
     case "sc":
       let t = ShortcutsTool()
       if sub == "list" {
@@ -5188,6 +5247,7 @@ struct App {
     case "note":
       helpText =
         "Note: sync [path] [--folder=NAME], new/append/update/delete/move [path] <folder> <title> [<content>|<target-folder>]"
+    case "ocr": helpText = "OCR: <image-path> - Extract text from image file"
     case "photo":
       helpText =
         "Photo: list [--json] [--screenshots] [--favorites] [--last N], ocr [<assetId>] [--screenshots --last N]"
@@ -5222,7 +5282,7 @@ struct App {
         """
     default:
       helpText =
-        "iKit v\(VERSION) | Usage: ikit [init|doctor|task|cal|note|photo|contact|sc|meet|timer|config] [command] [args] [--json] [--id] [--dry-run] [--help] [-v]"
+        "iKit v\(VERSION) | Usage: ikit [init|doctor|task|cal|note|photo|ocr|contact|sc|meet|timer|config] [command] [args] [--json] [--id] [--dry-run] [--help] [-v]"
     }
     print(helpText)
   }
