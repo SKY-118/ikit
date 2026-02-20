@@ -3025,6 +3025,56 @@ class NotesTool {
       }
     }
   }
+
+  /// Search notes by keyword
+  func search(keyword: String, folder: String? = nil, json: Bool = false) {
+    Logger.info("🔍 Searching for: \(keyword)")
+
+    // Get all notes
+    var allNotes = bridge.listAllNotesSafe()
+
+    // Filter by folder if specified
+    if let folderFilter = folder {
+      allNotes = allNotes.filter { $0.path.localizedCaseInsensitiveContains(folderFilter) }
+    }
+
+    // Filter by keyword in name (case-insensitive)
+    let matches = allNotes.filter { $0.name.localizedCaseInsensitiveContains(keyword) }
+
+    if matches.isEmpty {
+      Logger.info("No notes found matching: \(keyword)")
+      return
+    }
+
+    if json {
+      let f = ISO8601DateFormatter()
+      let dicts = matches.map { (id, name, path, modDate) -> [String: Any] in
+        return [
+          "id": id,
+          "name": name,
+          "folder": path,
+          "modificationDate": modDate != nil ? f.string(from: modDate!) : NSNull()
+        ]
+      }
+      if let data = try? JSONSerialization.data(withJSONObject: dicts, options: [.prettyPrinted]),
+        let output = String(data: data, encoding: .utf8)
+      {
+        print(output)
+      }
+    } else {
+      print("🔍 Found \(matches.count) note(s) matching '\(keyword)'")
+      print("---")
+      let f = DateFormatter()
+      f.dateFormat = "yyyy-MM-dd HH:mm"
+      for (id, name, path, modDate) in matches {
+        let dateStr = modDate != nil ? f.string(from: modDate!) : "Unknown"
+        let shortId = String(id.suffix(8))
+        print("  📄 \(name)")
+        print("     Folder: \(path)")
+        print("     Modified: \(dateStr) [\(shortId)]")
+      }
+    }
+  }
 }
 
 // MARK: - Reminders Tool
@@ -5121,6 +5171,10 @@ struct App {
       } else if sub == "ls" && args.count > 4 {
         let json = args.contains("--json")
         t.list(folder: args[4], json: json)
+      } else if sub == "search" && args.count > 4 {
+        let json = args.contains("--json")
+        let folder = getStringParam("--folder")
+        t.search(keyword: args[4], folder: folder, json: json)
       } else if sub == "new" && args.count > 6 {
         t.create(targetDir: root, folder: args[4], title: args[5], content: args[6])
       } else if sub == "append" && args.count > 6 {
