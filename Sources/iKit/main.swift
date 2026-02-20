@@ -2987,6 +2987,44 @@ class NotesTool {
       Logger.error("Failed: \(res)")
     }
   }
+
+  /// List notes in a specific folder
+  func list(folder: String, json: Bool = false) {
+    guard let folderId = findFolderId(path: folder) else {
+      Logger.error("Folder not found: \(folder)")
+      return
+    }
+
+    let notes = bridge.listNotesMetadata(inFolderId: folderId)
+    if notes.isEmpty {
+      Logger.info("No notes found in folder: \(folder)")
+      return
+    }
+
+    if json {
+      let f = ISO8601DateFormatter()
+      let dicts = notes.map { (name, modDate) -> [String: Any] in
+        return [
+          "name": name,
+          "modificationDate": modDate != nil ? f.string(from: modDate!) : NSNull()
+        ]
+      }
+      if let data = try? JSONSerialization.data(withJSONObject: dicts, options: [.prettyPrinted]),
+        let output = String(data: data, encoding: .utf8)
+      {
+        print(output)
+      }
+    } else {
+      print("📁 \(folder) (\(notes.count) notes)")
+      print("---")
+      let f = DateFormatter()
+      f.dateFormat = "yyyy-MM-dd HH:mm"
+      for (name, modDate) in notes {
+        let dateStr = modDate != nil ? f.string(from: modDate!) : "Unknown"
+        print("  \(name) [\(dateStr)]")
+      }
+    }
+  }
 }
 
 // MARK: - Reminders Tool
@@ -5080,6 +5118,9 @@ struct App {
       }
       if sub == "sync" {
         t.sync(targetDir: root, folderFilter: getStringParam("--folder"))
+      } else if sub == "ls" && args.count > 4 {
+        let json = args.contains("--json")
+        t.list(folder: args[4], json: json)
       } else if sub == "new" && args.count > 6 {
         t.create(targetDir: root, folder: args[4], title: args[5], content: args[6])
       } else if sub == "append" && args.count > 6 {
