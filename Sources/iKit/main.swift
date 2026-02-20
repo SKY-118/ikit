@@ -34,18 +34,129 @@ func IOPMAssertionRelease(_ AssertionID: IOPMAssertionID) -> IOReturn
 /// Global flag for graceful shutdown (non-isolated)
 nonisolated(unsafe) var isShuttingDown = false
 
+// MARK: - Transcription Process Manager
+/// Manages transcription child processes to ensure they are terminated when daemon stops
+class TranscriptionManager {
+  static let shared = TranscriptionManager()
+  private var activeProcesses: [Int32: Process] = [:]
+  private let lock = NSLock()
+  private let maxTranscriptionTime: TimeInterval = 3600  // 1 hour timeout
+
+  private init() {}
+
+  /// Run a transcription process with tracking and timeout
+  func runTranscription(
+    executable: String, args: [String], outputPipe: Pipe, errorPipe: Pipe
+  ) -> (output: String?, error: String?, exitCode: Int32) {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: executable)
+    task.arguments = args
+    task.standardOutput = outputPipe
+    task.standardError = errorPipe
+
+    do {
+      try task.run()
+
+      // Track the process
+      let pid = task.processIdentifier
+      lock.lock()
+      activeProcesses[pid] = task
+      lock.unlock()
+
+      Logger.info("🎤 Started transcription process (PID: \(pid))")
+
+      // Setup timeout monitoring
+      let timeoutWork = DispatchWorkItem { [weak self] in
+        if task.isRunning {
+          Logger.warn("⏰ Transcription timeout (1h), terminating PID: \(pid)")
+          task.terminate()
+          self?.removeProcess(pid)
+        }
+      }
+      DispatchQueue.global().asyncAfter(deadline: .now() + maxTranscriptionTime, execute: timeoutWork)
+
+      // Wait for completion
+      task.waitUntilExit()
+
+      // Remove from tracking
+      removeProcess(pid)
+
+      // Cancel timeout work if still pending
+      timeoutWork.cancel()
+
+      let outData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+      let errData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+      return (
+        String(data: outData, encoding: .utf8),
+        String(data: errData, encoding: .utf8),
+        task.terminationStatus
+      )
+    } catch {
+      return (nil, "Failed to start transcription: \(error)", -1)
+    }
+  }
+
+  private func removeProcess(_ pid: Int32) {
+    lock.lock()
+    activeProcesses.removeValue(forKey: pid)
+    lock.unlock()
+  }
+
+  /// Terminate all active transcription processes (called on daemon shutdown)
+  func terminateAllChildren() {
+    lock.lock()
+    let processes = activeProcesses
+    lock.unlock()
+
+    guard !processes.isEmpty else {
+      Logger.info("✅ No active transcription processes to terminate")
+      return
+    }
+
+    Logger.info("🛑 Terminating \(processes.count) transcription process(es)...")
+
+    // Send SIGTERM first
+    for (pid, process) in processes {
+      if process.isRunning {
+        Logger.info("   Sending SIGTERM to PID: \(pid)")
+        process.terminate()
+      }
+    }
+
+    // Wait up to 10 seconds for graceful termination
+    Thread.sleep(forTimeInterval: 5)
+
+    // Force kill any remaining processes
+    lock.lock()
+    for (pid, process) in activeProcesses {
+      if process.isRunning {
+        Logger.warn("   Force killing PID: \(pid)")
+        kill(pid, SIGKILL)
+        activeProcesses.removeValue(forKey: pid)
+      }
+    }
+    lock.unlock()
+
+    Logger.info("✅ All transcription processes terminated")
+  }
+}
+
 /// Setup signal handlers for graceful shutdown
 func setupSignalHandlers() {
   // SIGQUIT (Ctrl+\) is more reliable than SIGINT (Ctrl+C) for graceful shutdown
   signal(SIGQUIT) { _ in
     isShuttingDown = true
     print("\n🛑 Shutdown signal received (Ctrl+\\), finishing current work...")
+    // Terminate child transcription processes
+    TranscriptionManager.shared.terminateAllChildren()
     fflush(stdout)
   }
   // Also handle SIGTERM for `killall -TERM ikit` or system shutdown
   signal(SIGTERM) { _ in
     isShuttingDown = true
     print("\n🛑 Termination signal received, finishing current work...")
+    // Terminate child transcription processes
+    TranscriptionManager.shared.terminateAllChildren()
     fflush(stdout)
   }
   // Ignore SIGHUP to keep daemon running when shell session ends
@@ -2097,8 +2208,15 @@ class Daemon {
         "🎤 Auto-transcribing dual-track: \(micPath.lastPathComponent) + \(sysPath.lastPathComponent)"
       )
 
-      let result = Shell.run(
-        python, args: [script, micPath.path, sysPath.path, "--output", out.path])
+      // Use TranscriptionManager for tracked process with timeout
+      let outPipe = Pipe()
+      let errPipe = Pipe()
+      let result = TranscriptionManager.shared.runTranscription(
+        executable: python,
+        args: [script, micPath.path, sysPath.path, "--output", out.path],
+        outputPipe: outPipe,
+        errorPipe: errPipe
+      )
 
       if result.exitCode == 0 {
         Logger.info("✅ Transcription complete: \(out.lastPathComponent)")
@@ -2120,7 +2238,15 @@ class Daemon {
 
       Logger.info("🎤 Auto-transcribing: \(audioFile.lastPathComponent)")
 
-      let result = Shell.run(python, args: [script, audioFile.path, "--output", out.path])
+      // Use TranscriptionManager for tracked process with timeout
+      let outPipe = Pipe()
+      let errPipe = Pipe()
+      let result = TranscriptionManager.shared.runTranscription(
+        executable: python,
+        args: [script, audioFile.path, "--output", out.path],
+        outputPipe: outPipe,
+        errorPipe: errPipe
+      )
 
       if result.exitCode == 0 {
         Logger.info("✅ Transcription complete: \(out.lastPathComponent)")
@@ -5246,7 +5372,7 @@ struct App {
     case "cal": helpText = "Calendar: list [--json], new <title> <YYYY-MM-DD HH:mm>, delete <title>"
     case "note":
       helpText =
-        "Note: sync [path] [--folder=NAME], new/append/update/delete/move [path] <folder> <title> [<content>|<target-folder>]"
+        "Note: sync [path] [--folder=NAME], ls [path] <folder> [--json], search [path] <keyword> [--folder=NAME] [--json], new/append/update/delete/move [path] <folder> <title> [<content>|<target-folder>]"
     case "ocr": helpText = "OCR: <image-path> - Extract text from image file"
     case "photo":
       helpText =

@@ -5,8 +5,11 @@ import json
 import argparse
 import time
 import logging
-import numpy as np
+import signal
+from functools import wraps
 from pathlib import Path
+
+import numpy as np
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,6 +22,37 @@ try:
 except ImportError:
     REQUESTS_AVAILABLE = False
     logger.warning("requests module not available - LiteLLM engine will not work")
+
+# Default timeout for transcription (1 hour)
+DEFAULT_TIMEOUT = 3600
+
+class TimeoutError(Exception):
+    """Raised when a function times out."""
+    pass
+
+def timeout_handler(seconds):
+    """
+    Decorator to add timeout to a function.
+
+    Uses SIGALRM which works on Unix systems only.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            def _timeout_handler(signum, frame):
+                raise TimeoutError(f"Function {func.__name__} timed out after {seconds}s")
+
+            # Set up signal handler
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(seconds)
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            return result
+        return wrapper
+    return decorator
 
 def _get_language_name(code):
     """Get full language name from language code."""
@@ -913,6 +947,8 @@ def main():
                         help="ASR engine: funasr (Chinese), whisperx (English), mlx (English, Apple Silicon), litellm (API-based)")
     parser.add_argument("--language", "-l", default="auto",
                         help="Language code (zh, en, auto). Default: auto (auto-detect)")
+    parser.add_argument("--timeout", "-t", type=int, default=DEFAULT_TIMEOUT,
+                        help=f"Timeout in seconds (default: {DEFAULT_TIMEOUT}s = 1 hour)")
     parser.add_argument("--no-gating", action="store_true", help="Disable aggressive gating (FunASR only)")
     parser.add_argument("--mlx-model", default="mlx-community/whisper-large-v3-mlx",
                         help="MLX-Whisper model path (default: mlx-community/whisper-large-v3-mlx)")
@@ -925,6 +961,17 @@ def main():
     parser.add_argument("--litellm-model", help="LiteLLM model name (e.g., qwen-max)")
     parser.add_argument("--litellm-api-key", help="LiteLLM API key (if required)")
     args = parser.parse_args()
+
+    # Set up timeout
+    timeout_seconds = args.timeout
+    logger.info(f"⏱️ Timeout: {timeout_seconds}s ({timeout_seconds // 60}min)")
+
+    def _timeout_handler(signum, frame):
+        logger.error(f"❌ Transcription timed out after {timeout_seconds}s")
+        sys.exit(124)  # Standard timeout exit code
+
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout_seconds)
 
     # Check dependencies
     check_environment(require_whisperx=(args.engine == "whisperx"), require_mlx=(args.engine == "mlx"))
@@ -1033,6 +1080,10 @@ def main():
     else:
         logger.error(f"Expected 1 or 2 input files, got {len(input_files)}")
         sys.exit(1)
+
+    # Cancel timeout - transcription completed successfully
+    signal.alarm(0)
+    logger.info("✅ Transcription completed within timeout")
 
     # 3. Output Handling
     # Apply simplification if in simple mode (default)
