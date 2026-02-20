@@ -2897,6 +2897,38 @@ class NotesTool {
       ?? folders.first(where: { $0.path.hasSuffix(path) })?.id
   }
 
+  /// Find note name with fuzzy matching support
+  /// Returns (exactName, shouldProceed) - exactName is the matched note name, shouldProceed indicates if operation should continue
+  func findNoteWithFuzzyMatch(title: String, folderId: String) -> (exactName: String?, message: String?) {
+    // First, get all notes in the folder
+    let notes = bridge.listNotesMetadata(inFolderId: folderId)
+
+    // Check for exact match first
+    if notes.contains(where: { $0.name == title }) {
+      return (title, nil)
+    }
+
+    // Try fuzzy match (case-insensitive partial match)
+    let matches = notes.filter { $0.name.localizedCaseInsensitiveContains(title) }
+
+    if matches.isEmpty {
+      return (nil, "❌ Note not found: '\(title)'")
+    } else if matches.count == 1 {
+      // Single match - use it
+      let matchedName = matches[0].name
+      Logger.info("🔍 Fuzzy matched: '\(title)' → '\(matchedName)'")
+      return (matchedName, nil)
+    } else {
+      // Multiple matches - show suggestions
+      var msg = "⚠️  Multiple notes match '\(title)':\n"
+      for (i, (name, _)) in matches.enumerated() {
+        msg += "   \(i + 1). \(name)\n"
+      }
+      msg += "Please use the exact note name."
+      return (nil, msg)
+    }
+  }
+
   func create(targetDir: String, folder: String, title: String, content: String) {
     guard let fid = findFolderId(path: folder) else {
       Logger.error("Folder not found: \(folder)")
@@ -2915,9 +2947,17 @@ class NotesTool {
       Logger.error("Folder not found: \(folder)")
       return
     }
-    let res = bridge.appendToNote(name: title, folderId: fid, content: content)
+
+    // Try fuzzy matching for note title
+    let (exactTitle, errorMsg) = findNoteWithFuzzyMatch(title: title, folderId: fid)
+    guard let actualTitle = exactTitle else {
+      if let msg = errorMsg { print(msg) }
+      return
+    }
+
+    let res = bridge.appendToNote(name: actualTitle, folderId: fid, content: content)
     if res == "success" {
-      Logger.info("✅ Appended.")
+      Logger.info("✅ Appended to '\(actualTitle)'.")
       sync(targetDir: targetDir)
     } else {
       Logger.error("Failed: \(res)")
@@ -2928,9 +2968,17 @@ class NotesTool {
       Logger.error("Folder not found: \(folder)")
       return
     }
-    let res = bridge.updateNote(name: title, folderId: fid, content: content)
+
+    // Try fuzzy matching for note title
+    let (exactTitle, errorMsg) = findNoteWithFuzzyMatch(title: title, folderId: fid)
+    guard let actualTitle = exactTitle else {
+      if let msg = errorMsg { print(msg) }
+      return
+    }
+
+    let res = bridge.updateNote(name: actualTitle, folderId: fid, content: content)
     if res == "success" {
-      Logger.info("✅ Updated.")
+      Logger.info("✅ Updated '\(actualTitle)'.")
       sync(targetDir: targetDir)
     } else {
       Logger.error("Failed: \(res)")
@@ -2941,10 +2989,18 @@ class NotesTool {
       Logger.error("Folder not found: \(folder)")
       return
     }
-    let res = bridge.deleteNote(name: title, folderId: fid)
+
+    // Try fuzzy matching for note title
+    let (exactTitle, errorMsg) = findNoteWithFuzzyMatch(title: title, folderId: fid)
+    guard let actualTitle = exactTitle else {
+      if let msg = errorMsg { print(msg) }
+      return
+    }
+
+    let res = bridge.deleteNote(name: actualTitle, folderId: fid)
     if res == "success" {
-      Logger.info("✅ Deleted.")
-      let safeName = title.replacingOccurrences(of: "/", with: ":")
+      Logger.info("✅ Deleted '\(actualTitle)'.")
+      let safeName = actualTitle.replacingOccurrences(of: "/", with: ":")
       let localPath = (targetDir as NSString).appendingPathComponent(folder).appending(
         "/\(safeName).md")
       if fm.fileExists(atPath: localPath) {
@@ -2964,12 +3020,20 @@ class NotesTool {
       Logger.error("Target folder not found: \(targetFolder)")
       return
     }
-    let res = bridge.moveNote(name: title, fromFolderId: sourceId, toFolderId: targetId)
+
+    // Try fuzzy matching for note title
+    let (exactTitle, errorMsg) = findNoteWithFuzzyMatch(title: title, folderId: sourceId)
+    guard let actualTitle = exactTitle else {
+      if let msg = errorMsg { print(msg) }
+      return
+    }
+
+    let res = bridge.moveNote(name: actualTitle, fromFolderId: sourceId, toFolderId: targetId)
     if res == "success" {
-      Logger.info("✅ Moved note '\(title)' from '\(sourceFolder)' to '\(targetFolder)'")
+      Logger.info("✅ Moved note '\(actualTitle)' from '\(sourceFolder)' to '\(targetFolder)'")
       // Remove old file from source folder (local mirror cleanup)
       // Note: filename includes short ID suffix, so we need to find by prefix
-      let safeName = title.replacingOccurrences(of: "/", with: ":")
+      let safeName = actualTitle.replacingOccurrences(of: "/", with: ":")
       let sourceDirPath = (targetDir as NSString).appendingPathComponent(sourceFolder)
       if let enumerator = fm.enumerator(atPath: sourceDirPath) {
         for case let file as String in enumerator {
