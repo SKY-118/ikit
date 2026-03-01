@@ -5854,12 +5854,13 @@ struct App {
 
       Logger.info("   ▶️ Playing chunk \(index)/\(chunks.count)...")
 
+      // 用 open 启动 ffplay，让它独立运行（不受 iKit 信号影响）
       let process = Process()
-      process.executableURL = URL(fileURLWithPath: ffplayPath)
-      // 不使用 -nodisp，让 ffplay 显示控制窗口和响应键盘
+      process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
       process.arguments = [
+        "-a", "ffplay",
+        "--args",
         "-autoexit",
-        "-loglevel", "error",
         chunkURL.path
       ]
 
@@ -5895,15 +5896,17 @@ struct App {
     let fileList = files.map { "file '\($0.path)'" }.joined(separator: "\n")
     try fileList.write(toFile: listPath, atomically: true, encoding: .utf8)
 
+    // 用 open 启动 ffplay，让它独立运行
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: ffplayPath)
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
     process.arguments = [
+      "-a", "ffplay",
+      "--args",
       "-autoexit",
-      "-loglevel", "error",
       "-f", "concat",
       "-safe", "0",
       "-i", listPath,
-      "-vn"  // 禁用视频
+      "-vn"
     ]
 
     try process.run()
