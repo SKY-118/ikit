@@ -105,6 +105,58 @@ class TranscriptionManager {
     lock.unlock()
   }
 
+  /// Wait for all active transcription processes to complete (with timeout)
+  /// Returns true if all completed within timeout, false if some are still running
+  func waitForCompletion(timeout: TimeInterval = 300) async -> Bool {
+    let startTime = Date()
+    let checkInterval: TimeInterval = 1.0
+
+    while Date().timeIntervalSince(startTime) < timeout {
+      lock.lock()
+      let count = activeProcesses.count
+      lock.unlock()
+
+      if count == 0 {
+        Logger.info("✅ All transcriptions completed")
+        return true
+      }
+
+      // Check if any processes are still running
+      var runningCount = 0
+      lock.lock()
+      for (_, process) in activeProcesses {
+        if process.isRunning {
+          runningCount += 1
+        }
+      }
+      lock.unlock()
+
+      if runningCount == 0 {
+        Logger.info("✅ All transcriptions completed (processes finished, cleaning up...)")
+        // Clean up stale entries
+        lock.lock()
+        let pids = Array(activeProcesses.keys)
+        for pid in pids {
+          activeProcesses.removeValue(forKey: pid)
+        }
+        lock.unlock()
+        return true
+      }
+
+      Logger.debug("⏳ Waiting for \(runningCount) transcription(s) to complete...")
+
+      try? await Task.sleep(nanoseconds: UInt64(checkInterval * 1_000_000_000))
+    }
+
+    // Timeout reached
+    lock.lock()
+    let remainingCount = activeProcesses.count
+    lock.unlock()
+
+    Logger.warn("⚠️  Timeout waiting for transcriptions (\(Int(timeout))s), \(remainingCount) still active")
+    return false
+  }
+
   /// Terminate all active transcription processes (called on daemon shutdown)
   func terminateAllChildren() {
     lock.lock()
@@ -141,6 +193,14 @@ class TranscriptionManager {
     lock.unlock()
 
     Logger.info("✅ All transcription processes terminated")
+  }
+
+  /// Get count of active transcription processes
+  func activeProcessCount() -> Int {
+    lock.lock()
+    let count = activeProcesses.count
+    lock.unlock()
+    return count
   }
 }
 
@@ -1819,6 +1879,18 @@ class Daemon {
 
     // Run the main loop with daily directory
     await runLoop(outputDir: dailyDir, fm: fm)
+
+    // ⭐ Wait for any ongoing transcriptions to complete before exit
+    let activeCount = TranscriptionManager.shared.activeProcessCount()
+    if activeCount > 0 {
+      Logger.info("⏳ Waiting for \(activeCount) transcription(s) to complete...")
+      Logger.info("   (Press Ctrl+C again to force quit)")
+      let completed = await TranscriptionManager.shared.waitForCompletion(timeout: 300)
+      if !completed {
+        Logger.warn("⚠️  Some transcriptions did not complete in time, terminating...")
+        TranscriptionManager.shared.terminateAllChildren()
+      }
+    }
 
     // Normal exit cleanup
     Logger.info("✅ All recordings saved and finalized")
