@@ -5,6 +5,7 @@ import Contacts
 import Darwin
 import EventKit
 import Foundation
+import HealthKit
 import IOKit
 import Photos
 import ScreenCaptureKit
@@ -659,11 +660,12 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     Logger.info("✅ Configured voice processing I/O (AEC enabled)")
 
     // Create audio file for writing with optimized settings
-    // Use input format's sample rate, but lower bitrate for storage
+    // Force 48kHz output to ensure compatibility across all input devices
+    let outputSampleRate = 48000.0
     guard
       let fileFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
-        sampleRate: inputFormat.sampleRate,
+        sampleRate: outputSampleRate,
         channels: 1,
         interleaved: false
       )
@@ -677,7 +679,7 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         forWriting: outputURL,
         settings: [
           AVFormatIDKey: kAudioFormatMPEG4AAC,
-          AVSampleRateKey: inputFormat.sampleRate,
+          AVSampleRateKey: outputSampleRate,
           AVNumberOfChannelsKey: 1,
           AVEncoderBitRateKey: 64000,
         ])
@@ -688,6 +690,7 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
 
     // Install tap to record audio
     // Use larger buffer for stability
+    // Note: mixer output will be converted to outputSampleRate (48kHz)
     mixer.installTap(onBus: 0, bufferSize: 8192, format: fileFormat) { [weak self] buffer, time in
       guard let self = self, let file = self.audioFile else { return }
       do {
@@ -701,7 +704,8 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     do {
       try engine.start()
       Logger.info("✅ MicRecorder: Recording with AEC started")
-      Logger.info("   Sample rate: \(inputFormat.sampleRate) Hz")
+      Logger.info("   Input sample rate: \(inputFormat.sampleRate) Hz")
+      Logger.info("   Output sample rate: \(outputSampleRate) Hz")
       Logger.info("   Bit rate: 64kbps (speech optimized)")
       Logger.info("   AEC: Enabled (Voice Processing mode)")
     } catch {
@@ -723,12 +727,15 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     Logger.info("   Channels: \(inputFormat.channelCount), Sample rate: \(inputFormat.sampleRate)")
 
     // Create file for recording
+    // Force 48kHz output to ensure compatibility across all input devices
+    // AVAudioFile will automatically convert from input sample rate if needed
+    let outputSampleRate = 48000.0
     do {
       audioFile = try AVAudioFile(
         forWriting: outputURL,
         settings: [
           AVFormatIDKey: kAudioFormatMPEG4AAC,
-          AVSampleRateKey: inputFormat.sampleRate,
+          AVSampleRateKey: outputSampleRate,
           AVNumberOfChannelsKey: inputFormat.channelCount,
           AVEncoderBitRateKey: 64000,
         ])
@@ -738,7 +745,7 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     }
 
     // Install tap directly on input node with its native format
-    // This avoids format conversion issues that can cause silence
+    // AVAudioFile will handle sample rate conversion automatically
     inputNode.installTap(onBus: 0, bufferSize: 8192, format: inputFormat) {
       [weak self] buffer, time in
       guard let self = self, let file = self.audioFile else { return }
@@ -752,7 +759,8 @@ class MicRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     do {
       try engine.start()
       Logger.info("✅ MicRecorder: Recording started (no AEC)")
-      Logger.info("   Sample rate: \(inputFormat.sampleRate) Hz")
+      Logger.info("   Input sample rate: \(inputFormat.sampleRate) Hz")
+      Logger.info("   Output sample rate: \(outputSampleRate) Hz")
       Logger.info("   Channels: \(inputFormat.channelCount)")
       Logger.info("   Bit rate: 64kbps (speech optimized)")
       Logger.info("   AEC: Disabled (external audio output)")
@@ -3975,6 +3983,156 @@ class ShortcutsTool {
   }
 }
 
+// MARK: - Health Tool
+class HealthTool {
+  let healthStore = HKHealthStore()
+
+  enum HealthDataType: String, CaseIterable {
+    case steps = "steps"
+    case distance = "distance"
+    case activeEnergy = "activeEnergy"
+    case heartRate = "heartRate"
+    case restingHeartRate = "restingHeartRate"
+
+    var hkType: HKQuantityType? {
+      switch self {
+      case .steps: return HKQuantityType.quantityType(forIdentifier: .stepCount)
+      case .distance: return HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning)
+      case .activeEnergy: return HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)
+      case .heartRate: return HKQuantityType.quantityType(forIdentifier: .heartRate)
+      case .restingHeartRate: return HKQuantityType.quantityType(forIdentifier: .restingHeartRate)
+      }
+    }
+
+    var displayName: String {
+      switch self {
+      case .steps: return "步数"
+      case .distance: return "距离"
+      case .activeEnergy: return "活动能量"
+      case .heartRate: return "心率"
+      case .restingHeartRate: return "静息心率"
+      }
+    }
+
+    var unit: HKUnit {
+      switch self {
+      case .steps: return HKUnit.count()
+      case .distance: return HKUnit.meter()
+      case .activeEnergy: return HKUnit.kilocalorie()
+      case .heartRate, .restingHeartRate: return HKUnit(from: "count/min")
+      }
+    }
+  }
+
+  func checkAvailability() -> Bool {
+    guard HKHealthStore.isHealthDataAvailable() else {
+      print("❌ HealthKit is not available on this device")
+      print("")
+      print("Note: HealthKit on macOS requires:")
+      print("  1. macOS 13+ (Ventura or later)")
+      print("  2. App entitlements in Entitlements.plist")
+      print("  3. Health data synced from iPhone/iWatch to iCloud")
+      print("")
+      print("For CLI tools, HealthKit access is limited. Consider using iOS/iPadOS for full HealthKit functionality.")
+      return false
+    }
+    return true
+  }
+
+  func listTypes() {
+    Logger.info("Available health data types:")
+    for t in HealthDataType.allCases {
+      print("  \(t.rawValue) - \(t.displayName)")
+    }
+  }
+
+  func getTodaySummary(type: HealthDataType) {
+    guard checkAvailability() else { return }
+    guard let hkType = type.hkType else { return }
+
+    // 请求权限并查询数据
+    let calendar = Calendar.current
+    let now = Date()
+    guard let startOfDay = calendar.startOfDay(for: now) as Date? else { return }
+
+    let predicate = HKQuery.predicateForSamples(withStart: startOfDay, end: now, options: .strictStartDate)
+
+    let query = HKSampleQuery(
+      sampleType: hkType,
+      predicate: predicate,
+      limit: HKObjectQueryNoLimit,
+      sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: false)]
+    ) {
+      query, samples, error in
+
+      if let error = error {
+        Logger.error("Query failed: \(error.localizedDescription)")
+        return
+      }
+
+      guard let samples = samples as? [HKQuantitySample] else {
+        Logger.info("No \(type.displayName) data found for today")
+        return
+      }
+
+      // 计算今日总量
+      let total = samples.reduce(0.0) { sum, sample in
+        sum + sample.quantity.doubleValue(for: type.unit)
+      }
+
+      // 显示结果
+      let formatter = DateFormatter()
+      formatter.dateStyle = .short
+      Logger.info("今日\(type.displayName): \(Int(total)) \(type.unit.unitString)")
+    }
+
+    healthStore.execute(query)
+  }
+
+  func getRecentData(type: HealthDataType, hours: Int = 1) {
+    guard checkAvailability() else { return }
+    guard let hkType = type.hkType else { return }
+
+    let calendar = Calendar.current
+    let now = Date()
+    guard let startTime = calendar.date(byAdding: .hour, value: -hours, to: now) else { return }
+
+    let predicate = HKQuery.predicateForSamples(withStart: startTime, end: now, options: .strictStartDate)
+
+    let query = HKSampleQuery(
+      sampleType: hkType,
+      predicate: predicate,
+      limit: HKObjectQueryNoLimit,
+      sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]
+    ) {
+      query, samples, error in
+
+      if let error = error {
+        Logger.error("Query failed: \(error.localizedDescription)")
+        return
+      }
+
+      guard let samples = samples as? [HKQuantitySample] else {
+        Logger.info("No \(type.displayName) data found in the last \(hours) hour(s)")
+        return
+      }
+
+      let formatter = DateFormatter()
+      formatter.dateFormat = "HH:mm"
+
+      Logger.info("最近 \(hours) 小时的 \(type.displayName) 数据 (\(samples.count) 条记录):")
+
+      for sample in samples {
+        let value = sample.quantity.doubleValue(for: type.unit)
+        let time = formatter.string(from: sample.startDate)
+        print("  \(time) - \(String(format: "%.1f", value)) \(type.unit.unitString)")
+      }
+    }
+
+    healthStore.execute(query)
+  }
+}
+
 // MARK: - Shell Helper
 class Shell {
   static func run(_ command: String, args: [String]) -> (
@@ -6317,6 +6475,31 @@ struct App {
         "TTS: \(chunkFiles.count) files. Play: \(playCmd)", exitCode: 0,
         duration: Date().timeIntervalSince(startDate))
 
+    case "health":
+      let h = HealthTool()
+      if sub == "types" {
+        h.listTypes()
+      } else if sub == "today" && args.count > 3 {
+        let typeName = args[3]
+        if let type = HealthTool.HealthDataType(rawValue: typeName) {
+          h.getTodaySummary(type: type)
+        } else {
+          Logger.error("Unknown type: \(typeName)")
+          h.listTypes()
+        }
+      } else if sub == "recent" && args.count > 3 {
+        let typeName = args[3]
+        let hours = getIntParam("--hours") ?? 1
+        if let type = HealthTool.HealthDataType(rawValue: typeName) {
+          h.getRecentData(type: type, hours: hours)
+        } else {
+          Logger.error("Unknown type: \(typeName)")
+          h.listTypes()
+        }
+      } else {
+        printHelp(for: "health")
+      }
+
     default: printHelp(for: nil)
     }
   }
@@ -6597,6 +6780,21 @@ struct App {
         Doctor: System health check
           Checks Python, dependencies, and model cache status
         """
+    case "health":
+      helpText = """
+        Health: Query Apple Health data
+          types                          List all available data types
+          today <type>                   Get today's summary for a data type
+          recent <type> [--hours=N]      Get recent data (default: 1 hour)
+
+        Data types: steps, distance, activeEnergy, heartRate, restingHeartRate, bloodGlucose
+
+        Examples:
+          ikit health types
+          ikit health today steps
+          ikit health recent bloodGlucose
+          ikit health recent bloodGlucose --hours=2
+        """
     default:
       helpText = """
         iKit v\(VERSION) - Apple Ecosystem CLI for Agents
@@ -6607,6 +6805,7 @@ struct App {
           calendar   — Calendar (list, create, delete)
           photos     — Photos (list, ocr, search)
           contacts   — Contacts (search)
+          health     — HealthKit data (types)
 
         Productivity:
           meet       — Meeting recording (start, transcribe, process)
