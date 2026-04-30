@@ -32,9 +32,6 @@
 
 ## Paste to Your Agent
 
-```markdown
-## Paste to your agent
-
 ```
 Install iKit: git clone https://github.com/liyuankui/ikit.git && cd iKit
 
@@ -43,7 +40,6 @@ First install Swift: brew install swift
 Then build: swift build -c release && cp .build/release/ikit ~/.local/bin/
 
 Then verify: ikit --version
-```
 ```
 
 ---
