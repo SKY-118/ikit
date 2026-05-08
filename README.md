@@ -44,6 +44,27 @@ Then verify: ikit --version
 
 ---
 
+## 🤖 Agent Skills
+
+iKit ships ready-made AI agent skills for immediate use.
+
+| Skill | Path | 用途 |
+|-------|------|------|
+| **meeting-recorder** | `skills/meeting-recorder/` | 会议录音、转录、纪要生成、归档全流程 |
+
+### Install a skill
+
+```bash
+# Copy to your agent's skills directory
+cp -r skills/meeting-recorder ~/.agents/skills/
+# or for Claude Code
+cp -r skills/meeting-recorder ~/.claude/skills/
+```
+
+Then configure `{WORKSPACE_DIR}` and `{SKILL_DIR}` placeholders in `SKILL.md`. See [`skills/meeting-recorder/README.md`](skills/meeting-recorder/README.md) for full setup guide.
+
+---
+
 ## 快速开始
 
 ### 编译与安装
