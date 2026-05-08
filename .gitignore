@@ -7,6 +7,7 @@
 tmp/
 *.m4a
 *.json
+!skills/**/*.json
 *.log
 test_*.py
 test_*.sh
