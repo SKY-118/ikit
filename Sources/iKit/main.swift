@@ -966,11 +966,10 @@ class SystemRecorder: NSObject, SCStreamOutput {
     Task {
       try? await Task.sleep(nanoseconds: 5_000_000_000)  // 5 seconds
       if self.audioSampleCount == 0 {
-        Logger.error("❌ Screen Recording 权限未授予，系统音频无法录制")
-        Logger.error("   5 秒内未收到任何音频样本")
-        Logger.error("   请前往: System Settings → Privacy & Security → Screen Recording → 授权当前应用")
-        Logger.error("   授权后需重启启动应用")
-        Logger.warn("⚠️  当前仅麦克风录音可用，aggressive_gating 将无法工作")
+        // Bug 5 fix: warn only — do NOT crash daemon (Logger.error calls exit())
+        Logger.warn("⚠️  Screen Recording 权限可能未授予（5秒内0音频样本）")
+        Logger.warn("   系统音频录制已自动禁用，继续仅麦克风录音")
+        Logger.warn("   如需系统音频: System Settings → Privacy & Security → Screen Recording → 授权后重启")
       }
     }
   }
@@ -2066,7 +2065,14 @@ class Daemon {
 
     // Check FunASR availability
     if checkFunASRAvailability() {
-      Logger.info("✅ FunASR is available")
+      // Bug 4 fix: also verify transcribe_script path
+      let script = ConfigManager.shared.current.transcribe_script
+      if let script = script, !FileManager.default.fileExists(atPath: script) {
+        Logger.warn("⚠️  FunASR library OK but transcribe_script not found: \(script)")
+        Logger.warn("   Auto-transcription will be skipped. Fix: update transcribe_script in config")
+      } else {
+        Logger.info("✅ FunASR is available")
+      }
     } else {
       Logger.warn("⚠️  FunASR not found - transcription will be disabled")
       Logger.warn("   Install with: pip install funasr")
@@ -2277,6 +2283,12 @@ class Daemon {
   private func autoProcessRecordings(_ files: [URL], outputDir: String) async {
     let configManager = ConfigManager.shared
 
+    // Bug 1 fix: respect auto_transcribe config (false = skip)
+    guard configManager.getMeetAutoTranscribe() else {
+      Logger.info("⏭️  Auto-transcription disabled in config (auto_transcribe: false)")
+      return
+    }
+
     guard let python = configManager.current.python_path,
       let script = configManager.current.transcribe_script
     else {
@@ -2320,7 +2332,12 @@ class Daemon {
         await processSummaryIfNeeded(
           result: result, output: out, configManager: configManager, outputDir: outputDir)
       } else {
-        Logger.error("❌ Transcription failed for \(timestamp)")
+        // Bug 2 fix: warn only — daemon must NOT crash on transcription failure
+        Logger.warn("⚠️  Auto-transcription failed for \(timestamp) (exit: \(result.exitCode))")
+        if let errOut = result.error, !errOut.isEmpty {
+          Logger.warn("   Details: \(errOut.prefix(300))")
+        }
+        Logger.warn("   Recording is preserved. Retry manually: ikit transcribe <file>")
       }
     } else if files.count == 1 {
       // Single-track: only one file
@@ -2350,7 +2367,12 @@ class Daemon {
         await processSummaryIfNeeded(
           result: result, output: out, configManager: configManager, outputDir: outputDir)
       } else {
-        Logger.error("❌ Transcription failed for: \(audioFile.lastPathComponent)")
+        // Bug 2 fix: warn only — daemon must NOT crash on transcription failure
+        Logger.warn("⚠️  Auto-transcription failed for: \(audioFile.lastPathComponent) (exit: \(result.exitCode))")
+        if let errOut = result.error, !errOut.isEmpty {
+          Logger.warn("   Details: \(errOut.prefix(300))")
+        }
+        Logger.warn("   Recording is preserved. Retry manually: ikit transcribe <file>")
       }
     } else {
       Logger.warn("⚠️  No audio files to process")
@@ -5528,7 +5550,7 @@ class SecretaryTool {
 
 // MARK: - Main
 struct App {
-  static let VERSION = "2.9.0"
+  static let VERSION = "2.9.1"
 
   static func main() async {
     let args = CommandLine.arguments
@@ -6156,6 +6178,16 @@ struct App {
             agentError(
               "Python/Script path not configured",
               suggestion: "Run: ikit config && set python_path and transcribe_script"))
+          print("[exit:1 | 0ms]")
+          return
+        }
+
+        // Bug 3 fix: validate script path exists before running (gives clear error instead of "exit 2")
+        guard FileManager.default.fileExists(atPath: script) else {
+          print(
+            agentError(
+              "Transcription script not found at: \(script)",
+              suggestion: "Check transcribe_script in ~/.config/ikit/config.json"))
           print("[exit:1 | 0ms]")
           return
         }
