@@ -473,6 +473,7 @@ struct MeetConfig: Codable {
   var auto_transcribe: Bool?  // Whether to auto-transcribe segments
   var auto_summary: Bool?  // Whether to auto-generate meeting summary (default: true)
   var transcribe_engine: String?  // "ollama" | "litellm" (default: "ollama")
+  var transcribe_mode: String?  // "realtime" | "after_stop" (default: "after_stop")
 }
 
 struct Config: Codable {
@@ -514,7 +515,8 @@ class ConfigManager {
         default_mode: "both",
         auto_transcribe: true,
         auto_summary: true,
-        transcribe_engine: "ollama"
+        transcribe_engine: "ollama",
+        transcribe_mode: "after_stop"
       )
     )
     load()
@@ -562,6 +564,10 @@ class ConfigManager {
 
   func getMeetTranscribeEngine() -> String {
     return current.meet?.transcribe_engine ?? "ollama"
+  }
+
+  func getMeetTranscribeMode() -> String {
+    return current.meet?.transcribe_mode ?? "after_stop"
   }
 }
 
@@ -1843,6 +1849,7 @@ class Daemon {
   private var powerAssertionID: IOPMAssertionID = 0
   private let segmentDuration: UInt64  // Segment duration in nanoseconds
   private var processedSegments: Set<String> = []  // Track processed segments to prevent duplicate transcription
+  private var pendingTranscriptions: [([URL], String)] = []  // Queue for after_stop mode
   private let backgroundMode: Bool  // Whether running in background mode
   private var heartbeatPath: String?  // Path to heartbeat file
 
@@ -2272,6 +2279,16 @@ class Daemon {
     if mode == .both || mode == .sysOnly {
       await sys.stopCapture()
     }
+
+    // ⭐ Flush pending transcriptions (after_stop mode)
+    if !pendingTranscriptions.isEmpty {
+      let pending = pendingTranscriptions
+      pendingTranscriptions.removeAll()
+      Logger.info("🎤 Processing \(pending.count) queued transcriptions...")
+      for (files, outputDir) in pending {
+        await autoProcessRecordings(files, outputDir: outputDir)
+      }
+    }
   }
 
   private func stopRecording() async {
@@ -2365,6 +2382,13 @@ class Daemon {
     // Bug 1 fix: respect auto_transcribe config (false = skip)
     guard configManager.getMeetAutoTranscribe() else {
       Logger.info("⏭️  Auto-transcription disabled in config (auto_transcribe: false)")
+      return
+    }
+
+    // Defer transcription until after stop to avoid memory pressure during recording
+    if configManager.getMeetTranscribeMode() == "after_stop" && !isShuttingDown {
+      pendingTranscriptions.append((files, outputDir))
+      Logger.info("📋 Transcription queued (after_stop mode), will process when recording stops")
       return
     }
 
